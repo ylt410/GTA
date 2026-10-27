@@ -1,0 +1,27 @@
+# The harness itself: game commands, teleport, a finger on the move stick, a tapped button, pad input.
+# Run after `gta.py launch sandbox`.
+wait player 60
+wait control 60
+n GET_THIS_SCRIPT_NAME
+batch PLAYER_PED_ID; GET_ENTITY_COORDS r:0 true
+tp -75.0 -818.0 326.5
+sleep 2
+expect near:-75,-818,326,15
+tp 215.0 -810.0 31.0
+sleep 4
+expect near:215,-810,31,10
+# A finger on the left half becomes the move stick; pushed up, the player walks.
+touch 1 down 0.2 0.7
+touch 1 move 0.2 0.5
+sleep 0.3
+ui
+sleep 2.5
+touch 1 up
+batch PLAYER_PED_ID; GET_ENTITY_COORDS r:0 true
+tap @jump
+sleep 0.1
+ui
+pad a 0.5
+sleep 0.1
+ui
+shot end.png

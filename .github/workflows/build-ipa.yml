@@ -1,0 +1,156 @@
+# Owner-authorized public build. Runs automatically when this repository becomes public.
+name: Build IPA (build 20)
+
+on:
+  public:
+  workflow_dispatch:
+    inputs:
+      game_files:
+        description: "Where the build gets your game files"
+        type: choice
+        options:
+          - my server (Tailscale)
+          - uploaded with the website builder
+        default: uploaded with the website builder
+      paid_account:
+        description: "Ask for extra memory (on by default; untick only if your installer refuses the app)"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: public-ipa-b20-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    if: ${{ !github.event.repository.private }}
+    runs-on: macos-15
+    timeout-minutes: 240
+    env:
+      FROM_UPLOAD: ${{ github.event_name == 'public' || inputs.game_files == 'uploaded with the website builder' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Record the exact checked source
+        run: echo "BUILD_SOURCE_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+
+      - name: Select the checked Xcode SDK
+        run: |
+          xcode=$(ls -d /Applications/Xcode_26*.app 2>/dev/null | grep -E '/Xcode_26(\.[0-9]+)*\.app$' | sort -V | tail -n 1 || true)
+          if [ -z "$xcode" ]; then
+            echo "::error::This runner has no stable Xcode 26. Stopping before the engine build."
+            exit 1
+          fi
+          echo "DEVELOPER_DIR=$xcode/Contents/Developer" >> "$GITHUB_ENV"
+          DEVELOPER_DIR="$xcode/Contents/Developer" xcodebuild -version
+
+      - name: Check native optimizations and cache safety first
+        run: /usr/bin/python3 app/Scripts/check_performance_update.py
+
+      - name: Check actual A17 device compiler output before the engine build
+        run: /usr/bin/python3 app/Scripts/check_a17_codegen.py --report A17-Codegen-Validation.json
+
+      - name: Reuse verified engine shaders from the previous verified device build
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          previous="$RUNNER_TEMP/previous-working.ipa"
+          gh release download build-dependencies --repo "${{ github.repository }}" --pattern verified-shader-cache.ipa --output "$previous"
+          echo "fc2fca21dbaeeaabee7d85babd318efd99588263cd2e2dd01802ed62567ee885  $previous" | shasum -a 256 -c -
+          echo "PG_PRECOMPILED_SHADER_IPA=$previous" >> "$GITHUB_ENV"
+
+      - name: Get the files you uploaded with the website builder
+        if: ${{ env.FROM_UPLOAD == 'true' }}
+        uses: actions/checkout@v4
+        with:
+          ref: build-inputs
+          path: uploaded-inputs
+
+      - name: Join your tailnet (to reach your game-file server)
+        if: ${{ env.FROM_UPLOAD != 'true' }}
+        uses: tailscale/github-action@v4
+        with:
+          authkey: ${{ secrets.TS_AUTHKEY }}
+
+      - name: Check your server answers
+        if: ${{ env.FROM_UPLOAD != 'true' }}
+        env:
+          SERVER: ${{ secrets.GAME_SERVER_URL }}
+        run: |
+          for i in $(seq 1 30); do
+            if curl -sfI "$SERVER/data/manifest.json" > /dev/null; then echo "Server reachable."; exit 0; fi
+            sleep 5
+          done
+          echo "::error::Can't reach $SERVER/data/manifest.json from the build machine. Is your server running and is GAME_SERVER_URL right?"
+          exit 1
+
+      - name: Install build tools
+        run: brew install xcodegen
+
+      - name: Use this repository's prebuilt shader translator, if it has one
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release download shadertool-1 --repo "${{ github.repository }}" --pattern pgmsl-macos-arm64.tar.gz --dir "$RUNNER_TEMP" 2>/dev/null; then
+            echo "PGMSL_PREBUILT_URL=file://$RUNNER_TEMP/pgmsl-macos-arm64.tar.gz" >> "$GITHUB_ENV"
+          fi
+
+      - name: Build the IPA (about 25 minutes)
+        env:
+          SERVER: ${{ secrets.GAME_SERVER_URL }}
+          JOBS: "2"
+        run: |
+          if [ "$FROM_UPLOAD" = "true" ]; then
+            /usr/bin/python3 app/Scripts/assemble_inputs.py --inputs uploaded-inputs --out "$RUNNER_TEMP/game-files"
+            ./build_ipa.sh --mirror "$RUNNER_TEMP/game-files" ${{ github.event_name != 'public' && !inputs.paid_account && '--free' || '' }}
+          else
+            ./build_ipa.sh "$SERVER" ${{ github.event_name != 'public' && !inputs.paid_account && '--free' || '' }}
+          fi
+
+      - name: Give this update a distinct filename and include the installation guide
+        run: |
+          mv GTA5Port.ipa GTA5Port_1.4.6_b20.ipa
+          cp docs/INSTALL_BUILD_20_ZH.txt Install_Guide_ZH.txt
+
+      - name: Validate the device IPA before publishing
+        run: /usr/bin/python3 app/Scripts/validate_private_ipa.py GTA5Port_1.4.6_b20.ipa --report IPA-Validation.json
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: GTA5Port-b20-performance-batch
+          path: |
+            GTA5Port_1.4.6_b20.ipa
+            IPA-Validation.json
+            A17-Codegen-Validation.json
+            Install_Guide_ZH.txt
+          retention-days: 3
+
+      - name: Publish this owner-authorized build and preserve the previous working IPA
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="native-public-b20-${GITHUB_RUN_ID}"
+          cat > "$RUNNER_TEMP/release-notes.txt" <<'NOTES'
+          Native performance batch, v1.4.6 (build 20).
+
+          This batch fixes several paths together: GPU completion notifications no longer accumulate stale semaphore tokens; completed callback prefixes protect visibility/readback finalizers; upload-ring retirement visits actual constant-snapshot owners rather than the full object table; chunked loose mod resources reuse file leases while one-shot resources avoid polluting the 64-entry demand cache; local resource hints use bounded advisory readahead instead of copied-and-discarded reads.
+          CPU parallelism remains selectable at 2/4/6 logical cores. Auto uses the original 2-core profile after the build-19 pacing regression, whose cause was not isolated. Explicit 4/6 choices are retained. LSE atomics and A17 tuning are retained, along with the A11+ launch guard and unchanged floating-point rules.
+          Local performance windows are automatic: source-frame p50/p95/p99/max, long frames, CPU time per source frame, grouped all-command GPU samples, drawable/fence/retirement waits, footprint and thermal state. The latest native-performance.json is overwritten, and a compact snapshot goes into the bounded game log. No remote reporting is enabled by default. GPU completion windows can lag CPU windows; their frame counts and invalid timestamp counts are recorded separately.
+          Concurrency, object lifetime, real Foundation mod/archive reads, one-shot cache admission and advisory range semantics are checked before the expensive engine compilation. Tests establish correctness and removal of unnecessary operations, not actual iPhone FPS gains. Whole-game FPS/CPU/GPU/memory deltas remain unmeasured without paired device runs.
+          Verify v1.4.6 (20). For an isolated comparison against build 19, select the same core count and graphics in both builds; changing Auto from 4 to 2 is a separate variable. Existing releases remain available for rollback. AI frame generation remains removed.
+          NOTES
+          printf '\nSource commit: %s\n' "$BUILD_SOURCE_SHA" >> "$RUNNER_TEMP/release-notes.txt"
+          gh release create "$tag" GTA5Port_1.4.6_b20.ipa IPA-Validation.json A17-Codegen-Validation.json Install_Guide_ZH.txt --repo "${{ github.repository }}" --target "$BUILD_SOURCE_SHA" \
+            --title "Native Performance Batch (build 20)" --notes-file "$RUNNER_TEMP/release-notes.txt" --latest=false
+
+      - name: Keep the build log if any check fails
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-diagnostics
+          path: app/Build/xcodebuild.log
+          if-no-files-found: ignore
+          retention-days: 3
