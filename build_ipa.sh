@@ -36,7 +36,7 @@ fi
 "$PY" Scripts/prepare.py --mirror "$MIRROR"
 # Exercise the real Foundation asset read path after its generated headers
 # exist, before spending time compiling the native game engine.
-sh Tests/check_local_asset_reads.sh
+sh Tests/check_local_asset_reads.sh 2>&1 | tee Build/local-asset-reads.log
 # The app opens with your server already filled in (without one, it asks where your files are).
 /usr/libexec/PlistBuddy -c "Set :PGDefaultAssetServer $SERVER" App/Info.plist
 /usr/libexec/PlistBuddy -c "Set :PGLiteMode $LITE" App/Info.plist

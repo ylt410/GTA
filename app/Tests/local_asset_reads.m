@@ -145,6 +145,11 @@ static void testLocalAdvisoryHints(NSString *root){
   assetFiles=@[@[@"advice.rpf",@1543]];modArchives=&archive;modArchiveCount=1;
   uint8_t output[1543];forceShortReads=false;calls=interruptOn=errorOn=0;
   pg_local_asset_reader_clear();assert(readAsset(0,0,output,sizeof output)==sizeof output);
+  // Whole-slot reads intentionally use transient descriptors. Only the base
+  // is retained so far; a partial demand read warms the shared slot pathname.
+  assert(pg_local_asset_reader_stats().cached==1);
+  assert(readAsset(0,513,output,6)==6&&!memcmp(output,mod+3,6));
+  assert(pg_local_asset_reader_stats().cached==2);
   PGLocalAssetReaderStats warm=pg_local_asset_reader_stats();
   resetAdviceProbe();
   pg_asset_hint_push(&normalHints,(PGAssetHint){.id=0,.offset=4,.length=1539});pumpLocalAssetHints(1000);
@@ -154,6 +159,18 @@ static void testLocalAdvisoryHints(NSString *root){
   // Exact/nested duplicate hints are coalesced; advisory work has no demand reads.
   pg_asset_hint_push(&normalHints,(PGAssetHint){.id=0,.offset=512,.length=7});pumpLocalAssetHints(1100);
   assert(localAdvice.duplicates==1&&adviceCount==4&&!calls);
+  // With only the base cached, the three slots share a cold pathname but
+  // each advisory lease is temporary. The two-open budget must still apply.
+  pg_local_asset_reader_clear();assert(readAsset(0,0,output,sizeof output)==sizeof output);
+  assert(pg_local_asset_reader_stats().cached==1);
+  resetAdviceProbe();
+  pg_asset_hint_push(&normalHints,(PGAssetHint){.id=0,.offset=4,.length=1539});pumpLocalAssetHints(1200);
+  assert(!calls&&adviceCount==3&&localAdvice.bytes==14&&localAdvice.errors==0);
+  assert(localAdvice.coldOpens==2&&localAdvice.windowCold==2);
+  assert(pg_local_asset_reader_stats().cached==1&&!pg_local_asset_reader_stats().leased);
+  assertAdvice(0,basePath,4,4);assertAdvice(1,slotPath,2,7);assertAdvice(2,slotPath,0,3);
+  // A skipped optional hint must not change the subsequent demand read.
+  assert(readAsset(0,1536,output,7)==7&&!memcmp(output,mod,7));
   // An unsupported/failing advisory syscall is nonfatal; demand data still works.
   resetAdviceProbe();failAdvice=true;
   pg_asset_hint_push(&normalHints,(PGAssetHint){.id=0,.offset=0,.length=4});pumpLocalAssetHints(2000);

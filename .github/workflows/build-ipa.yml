@@ -151,6 +151,8 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: build-diagnostics
-          path: app/Build/xcodebuild.log
+          path: |
+            app/Build/xcodebuild.log
+            app/Build/local-asset-reads.log
           if-no-files-found: ignore
           retention-days: 3
