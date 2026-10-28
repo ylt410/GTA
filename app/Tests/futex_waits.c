@@ -11,6 +11,14 @@
 #include <time.h>
 #include <unistd.h>
 
+#if defined(PG_FUTEX_TESTING)
+// Test-only synchronization hooks implemented by WasmFutex.c.
+void pg_futex_test_lock_address(const void *address);
+void pg_futex_test_unlock_address(const void *address);
+unsigned pg_futex_test_bucket_index(const void *address);
+unsigned pg_futex_test_waiter_count(const void *address);
+#endif
+
 static _Alignas(64) uint8_t heap[8192];
 static wasm_rt_shared_memory_t memory = {sizeof heap, heap};
 static _Thread_local jmp_buf trapTarget;
@@ -107,6 +115,53 @@ static void isolatedAddresses(void) {
   }
   for (unsigned i = 0; i < 4; i++) { pthread_join(threads[i], NULL); assert(tasks[i].result == 0); }
 }
+#if defined(PG_FUTEX_TESTING)
+struct NotifyTask { uint64_t at; _Atomic bool done; uint32_t result; };
+static void *notifyOne(void *pointer) {
+  struct NotifyTask *task = pointer;
+  task->result = pg_atomic_notify(&memory, task->at, 1);
+  atomic_store(&task->done, true);
+  return NULL;
+}
+static void crossBucketProgress(void) {
+  reset();
+  const uint64_t blockedAt = 0;
+  uint64_t independentAt = UINT64_MAX;
+  const void *blockedAddress = heap + blockedAt;
+  for (uint64_t at = 4; at < sizeof heap; at += 4) {
+    if (pg_futex_test_bucket_index(heap + at) != pg_futex_test_bucket_index(blockedAddress)) {
+      independentAt = at;
+      break;
+    }
+  }
+  assert(independentAt != UINT64_MAX);
+
+  pthread_t waiter;
+  struct WaitTask waiting = {0, 4, independentAt, 0, UINT64_MAX, 99};
+  assert(!pthread_create(&waiter, NULL, oneWait, &waiting));
+  double queuedDeadline = seconds(CLOCK_MONOTONIC) + 5;
+  while (!pg_futex_test_waiter_count(heap + independentAt)) {
+    assert(seconds(CLOCK_MONOTONIC) < queuedDeadline);
+    pauseBriefly();
+  }
+
+  // Hold one address bucket. A notify for the other bucket must finish before
+  // this lock is released; the former process-wide queue cannot make progress.
+  pg_futex_test_lock_address(blockedAddress);
+  struct NotifyTask notifying = {independentAt, false, 99};
+  pthread_t notifier;
+  assert(!pthread_create(&notifier, NULL, notifyOne, &notifying));
+  double progressDeadline = seconds(CLOCK_MONOTONIC) + 0.5;
+  while (!atomic_load(&notifying.done) && seconds(CLOCK_MONOTONIC) < progressDeadline)
+    pauseBriefly();
+  bool progressedWhileBlocked = atomic_load(&notifying.done);
+  pg_futex_test_unlock_address(blockedAddress);
+  pthread_join(notifier, NULL);
+  pthread_join(waiter, NULL);
+  assert(progressedWhileBlocked);
+  assert(notifying.result == 1 && waiting.result == 0);
+}
+#endif
 static void timeoutNotifyRaces(void) {
   for (unsigned trial = 0; trial < 128; trial++) {
     reset(); pthread_t thread;
@@ -175,7 +230,11 @@ int main(int argc, char **argv) {
     runLoops((unsigned)strtoul(argv[2], NULL, 10), (unsigned)strtoul(argv[3], NULL, 10),
       (unsigned)strtoul(argv[4], NULL, 10), true); return 0;
   }
-  fastAndTrapCases(); partialAndMixedWaits(); isolatedAddresses(); timeoutNotifyRaces();
+  fastAndTrapCases(); partialAndMixedWaits(); isolatedAddresses();
+#if defined(PG_FUTEX_TESTING)
+  crossBucketProgress();
+#endif
+  timeoutNotifyRaces();
   runLoops(2, 10000, 2, false); runLoops(8, 10000, 2, false);
   runLoops(8, 10000, 0, false); runLoops(8, 10000, 1, false);
   puts("PASS: production futex fast paths, traps, exact partial/mixed wake, aliases, address isolation, timeout races and concurrent handoffs");

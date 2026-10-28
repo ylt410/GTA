@@ -18,6 +18,7 @@
 #include "MRMeshSlabAllocator.h"
 #include "MRSerialCompletion.h"
 #include "MRSnapshotOwners.h"
+#include "MRDepthProxyRange.h"
 #include "BCTextureDecoder.h"
 #include "BC1ToASTC.h"
 #include "NativeGraphics.h"
@@ -246,6 +247,8 @@ struct Renderer {
 	std::unordered_map<uint64_t, Pipe *> pipes;
 	std::unordered_map<uint32_t, ComputePipe> computePipes;
 	std::unordered_map<uint64_t, id<MTLDepthStencilState>> dssCache;
+	// Renderer-thread-only cache of valid source->depth-proxy subresources.
+	std::unordered_map<uint32_t, DepthProxyValidity> depthProxyValidity;
 	std::atomic<uint32_t> pipesPending{0};
 	uint32_t pipesMade = 0;
 	std::mutex pipeLock;
@@ -273,6 +276,7 @@ struct Renderer {
 	uint64_t draws = 0, skipped = 0, pendingSkips = 0, clamped = 0, presents = 0, commits = 0;
 	uint64_t immediateBinds = 0, immediateReuses = 0;
 	uint64_t identicalConstantUploads = 0, identicalConstantBytes = 0, identicalTargets = 0;
+	uint64_t depthProxyRequests = 0, depthProxySubresourceCopies = 0, depthProxyTexels = 0, depthProxyFullReferenceTexels = 0;
 	uint64_t ringRetiredBytes = 0;
 	SnapshotOwners snapshotOwners;
 	uint64_t snapshotOwnersVisited = 0, snapshotOwnersReleased = 0, serialWaitCalls = 0;
@@ -571,6 +575,8 @@ static State *state(uint32_t id) { return R->objs.as<State>(id, OState); }
 static uint32_t bcBlockBytes(int kind);
 static void createTexture(const uint32_t *p) {
 	uint32_t id = p[0], dim = p[1], w = std::max(1u, p[2]), h = std::max(1u, p[3]), d = std::max(1u, p[4]), mips = std::max(1u, p[5]);
+	// A replayed/damaged ring can replace an ID; do not retain its proxy bits.
+	R->depthProxyValidity.erase(id);
 	uint32_t arraySize = std::max(1u, p[6]), dxgi = p[7], bind = p[8], samples = std::max(1u, p[9]);
 	FormatInfo m = mapFormat(dxgi, bind);
 	auto *t = new Texture(id);
@@ -971,7 +977,11 @@ static id<MTLTexture> srvTexture(View *v, Texture *t, const ResBinding &b) {
 	uint32_t layers = t->dim == 3 ? 1 : t->depthOrLayers;
 	uint32_t first = std::min(v->c, layers - 1), slices;
 	if (b.dim == DCube) slices = 6;
-	else if (b.dim == DCubeArray) slices = v->d ? v->d * 6 : (layers - first) / 6 * 6;
+	else if (b.dim == DCubeArray) {
+		// Match demanded-copy range validation before multiplication can wrap.
+		if (v->d > (layers - first) / 6) return nil;
+		slices = v->d ? v->d * 6 : (layers - first) / 6 * 6;
+	}
 	else if (b.dim == D2Array) slices = v->d ? std::min(v->d, layers - first) : layers - first;
 	else slices = 1;
 	if (t->dim == 3) { first = 0; slices = 1; }
@@ -1311,8 +1321,19 @@ static id<MTLDepthStencilState> depthStencilState() {
 
 // ---- depth copies: D3D11 compares against any float texture; Metal only against depth textures ---------------------
 static id<MTLRenderPipelineState> depthCopyPipe;
-static void refreshDepthProxy(Texture *t) {
+static DepthProxyViewKind depthProxyViewKind(TexDim dim) {
+	switch (dim) {
+	case D2Array: return DepthProxyViewKind::Array;
+	case DCube: return DepthProxyViewKind::Cube;
+	case DCubeArray: return DepthProxyViewKind::CubeArray;
+	default: return DepthProxyViewKind::Single;
+	}
+}
+static void refreshDepthProxy(Texture *t, View *view, const ResBinding &binding) {
 	if (t->skip) { logOnce("liteproxy", "Metal renderer: Lite: depth proxy of a reduced texture not supported"); return; }
+	const DepthProxyRange range = depthProxyRange(t->mips, t->depthOrLayers, view->a, view->b, view->c, view->d,
+	                                               depthProxyViewKind(binding.dim));
+	if (!range.valid) return; // srvTexture returns nil for these invalid cube ranges too.
 	if (!t->depthProxy) {
 		auto *px = new Texture(0);
 		px->format = MTLPixelFormatDepth32Float; px->isDepth = true; px->dim = 2; px->width = t->width; px->height = t->height;
@@ -1325,10 +1346,31 @@ static void refreshDepthProxy(Texture *t) {
 		t->depthProxy = px;
 		t->proxyDirty = true;
 	}
-	if (!t->proxyDirty || !t->depthProxy->tex) return;
+	if (!t->depthProxy->tex) return;
+	DepthProxyValidity &validity = R->depthProxyValidity[t->oid];
+	const uintptr_t sourceIdentity = reinterpret_cast<uintptr_t>((__bridge void *)t->tex);
+	const uintptr_t proxyIdentity = reinterpret_cast<uintptr_t>((__bridge void *)t->depthProxy->tex);
+	const bool replaced = validity.configure(t->mips, t->depthProxy->depthOrLayers, sourceIdentity, proxyIdentity);
+	const bool sourceChanged = t->proxyDirty || replaced;
+	if (sourceChanged) validity.invalidateAll();
+	if (!sourceChanged) {
+		bool needed = false;
+		for (uint32_t mip = range.baseMip; mip < range.baseMip + range.mipCount && !needed; mip++)
+			for (uint32_t layer = range.firstLayer; layer < range.firstLayer + range.layerCount; layer++)
+				if (!validity.valid(mip, layer)) { needed = true; break; }
+		if (!needed) return;
+	}
+	R->depthProxyRequests++;
+	if (sourceChanged) {
+		for (uint32_t mip = 0; mip < t->mips; mip++) {
+			const uint64_t texels = (uint64_t)std::max(1u, t->width >> mip) * std::max(1u, t->height >> mip);
+			R->depthProxyFullReferenceTexels += texels * t->depthProxy->depthOrLayers;
+		}
+	}
 	endEncoders();
 	Texture *px = t->depthProxy;
-	for (uint32_t mip = 0; mip < px->mips; mip++) for (uint32_t layer = 0; layer < px->depthOrLayers; layer++) {
+	for (uint32_t mip = range.baseMip; mip < range.baseMip + range.mipCount; mip++) for (uint32_t layer = range.firstLayer; layer < range.firstLayer + range.layerCount; layer++) {
+		if (validity.valid(mip, layer)) continue;
 		uint64_t key = ((uint64_t)mip << 32) | layer;
 		auto it = t->views.find(key ^ 0xd3d3000000000000ull);
 		id<MTLTexture> src;
@@ -1343,6 +1385,9 @@ static void refreshDepthProxy(Texture *t) {
 		[e setFragmentTexture:src atIndex:0];
 		[e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
 		[e endEncoding];
+		validity.markValid(mip, layer);
+		R->depthProxySubresourceCopies++;
+		R->depthProxyTexels += (uint64_t)std::max(1u, t->width >> mip) * std::max(1u, t->height >> mip);
 	}
 	t->proxyDirty = false;
 	t->lastUse = R->serial;
@@ -1352,7 +1397,7 @@ static void prepareProxies(ShaderInfo *info, int stage) {
 		if (b.kind != RDepth) continue;
 		View *v = view(R->srv[stage][(b.binding - 32) & 127], OSrv);
 		Texture *t = v && !v->isBuf ? texture(v->res) : nullptr;
-		if (t && t->tex && !t->isDepth && t->samples == 1 && t->dim != 3) refreshDepthProxy(t);
+		if (t && v && t->tex && !t->isDepth && t->samples == 1 && t->dim != 3) refreshDepthProxy(t, v, b);
 	}
 }
 
@@ -2002,6 +2047,7 @@ static void generateMips(uint32_t srvId) {
 	if (!t || !t->tex || t->mips < 2 || t->isDepth || t->samples > 1) return;
 	[blitEncoder() generateMipmapsForTexture:t->tex];
 	t->lastUse = R->serial;
+	t->proxyDirty = true;
 }
 
 // ---- UAV counters and clears ------------------------------------------------------------------------------------------
@@ -2383,6 +2429,7 @@ static void destroyObject(uint32_t oid) {
 	if (!o) return;
 	if (o->kind == OBuffer) R->snapshotOwners.forget(oid);
 	if (o->kind == OTexture) {
+		R->depthProxyValidity.erase(oid);
 		R->clears.erase(std::remove_if(R->clears.begin(), R->clears.end(), [oid](const PendingClear &c) { return c.tex == oid; }), R->clears.end());
 		for (auto &r : R->rt) if (r.tex == oid) R->rtDirty = true;
 		if (R->ds.tex == oid) R->rtDirty = true;
@@ -2591,6 +2638,11 @@ static void report() {
 	     gTextureStats.gpuBytes / MB, gTextureStats.bcGameBytes / MB, gTextureStats.bcGpuBytes / MB, gTextureStats.shadowBytes / MB,
 	     (unsigned long long)gTextureStats.bcReadbacks.load(), (unsigned long long)gTextureStats.bcCopies.load(),
 	     (unsigned long long)gTextureStats.createFailures.load(), (unsigned long long)gTextureStats.decodeFailures.load());
+	logf("[metal] depth proxies since launch: %llu refreshes, %llu subresources / %.0f M texels copied; full-copy reference %.0f M texels",
+	     (unsigned long long)R->depthProxyRequests, (unsigned long long)R->depthProxySubresourceCopies,
+	     R->depthProxyTexels / 1000000.0, R->depthProxyFullReferenceTexels / 1000000.0);
+	// Keep both totals cumulative: later views can fill another subresource of
+	// an older invalidation epoch, including across a periodic report boundary.
 	PGNoteTextureRatio(gTextureStats.bcGpuBytes.load(), gTextureStats.bcGameBytes.load());		// the next boot's texture budget (GTA-123)
 	std::string kinds;
 	for (int k = 1; k < 8; k++) for (int srgb = 0; srgb < 2; srgb++) if (int64_t v = gTextureStats.kindBytes[k][srgb]) {

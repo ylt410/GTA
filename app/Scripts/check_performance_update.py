@@ -33,6 +33,7 @@ def main():
         ('gpu_frame_timing', cxx, 'c++17', 'Tests/gpu_frame_timing.cpp'),
         ('renderer_completion_owners', cxx, 'c++17', 'Tests/renderer_completion_owners.cpp'),
         ('mesh_slab_allocator', cxx, 'c++17', 'Tests/metal_mesh_slab_allocator.cpp'),
+        ('depth_proxy_range', cxx, 'c++17', 'Tests/metal_depth_proxy_range.cpp'),
     ]
     with tempfile.TemporaryDirectory(prefix='fanport-preflight-') as work:
         for name, compiler, standard, source in tests:
@@ -44,7 +45,7 @@ def main():
         run([shutil.which('python3') or 'python3', 'Tests/precompiled_shaders.py'])
         futex = Path(work) / 'futex-waits'
         feature = '-D_DARWIN_C_SOURCE' if platform.system() == 'Darwin' else '-D_GNU_SOURCE'
-        run([cc, '-std=c11', feature, '-O2', '-Wall', '-Wextra', '-Werror', '-pthread',
+        run([cc, '-std=c11', feature, '-O2', '-Wall', '-Wextra', '-Werror', '-pthread', '-DPG_FUTEX_TESTING',
              '-I', 'Tests/futex_support', '-I', 'Source', '-include', 'Tests/futex_support/platform.h',
              'Source/WasmFutex.c', 'Tests/futex_waits.c', '-o', futex])
         run([futex])

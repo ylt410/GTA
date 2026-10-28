@@ -1,5 +1,5 @@
 # Owner-authorized public build. Runs automatically when this repository becomes public.
-name: Build IPA (build 21)
+name: Build IPA (build 22)
 
 on:
   public:
@@ -21,7 +21,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: public-ipa-b21-${{ github.repository }}
+  group: public-ipa-b22-${{ github.repository }}
   cancel-in-progress: false
 
 jobs:
@@ -52,6 +52,9 @@ jobs:
 
       - name: Check actual A17 device compiler output before the engine build
         run: /usr/bin/python3 app/Scripts/check_a17_codegen.py --report A17-Codegen-Validation.json
+
+      - name: Compare synchronization work and validate demanded Metal depth copies
+        run: /usr/bin/python3 app/Scripts/check_a17_efficiency.py --report A17-Efficiency-Validation.json
 
       - name: Reuse verified engine shaders from the previous verified device build
         env:
@@ -112,19 +115,20 @@ jobs:
 
       - name: Give this update a distinct filename and include the installation guide
         run: |
-          mv GTA5Port.ipa GTA5Port_1.4.6_b21.ipa
-          cp docs/INSTALL_BUILD_21_ZH.txt Install_Guide_ZH.txt
+          mv GTA5Port.ipa GTA5Port_1.4.6_b22.ipa
+          cp docs/INSTALL_BUILD_22_ZH.txt Install_Guide_ZH.txt
 
       - name: Validate the device IPA before publishing
-        run: /usr/bin/python3 app/Scripts/validate_private_ipa.py GTA5Port_1.4.6_b21.ipa --report IPA-Validation.json
+        run: /usr/bin/python3 app/Scripts/validate_private_ipa.py GTA5Port_1.4.6_b22.ipa --report IPA-Validation.json
 
       - uses: actions/upload-artifact@v4
         with:
-          name: GTA5Port-b21-rural-memory
+          name: GTA5Port-b22-a17-efficiency
           path: |
-            GTA5Port_1.4.6_b21.ipa
+            GTA5Port_1.4.6_b22.ipa
             IPA-Validation.json
             A17-Codegen-Validation.json
+            A17-Efficiency-Validation.json
             Install_Guide_ZH.txt
           retention-days: 3
 
@@ -132,18 +136,18 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          tag="native-public-b21-${GITHUB_RUN_ID}"
+          tag="native-public-b22-${GITHUB_RUN_ID}"
           cat > "$RUNNER_TEMP/release-notes.txt" <<'NOTES'
-          Rural streaming memory fix, v1.4.6 (build 21).
+          A17 CPU/GPU efficiency update, v1.4.6 (build 22).
 
-          Keep the player's physical memory cap, while choosing the virtual engine reservation from the actual device allowance. The 6144 MB device / 5120 MB physical-cap case now reserves 5120 MB virtual rather than 4096 MB; mapping fallback and physical streaming/video budgets remain enforced.
-          Release wholly empty mesh slab backing only after its GPU completion serial. Stable sparse IDs and delayed ranges prevent reuse of in-flight data. Normal frame retirement keeps a small warm floor; the existing memory guard, real heap growth and iOS warnings request earlier completed-only reclamation. Allocation paths collect pending frees without scanning all backing for trim on every buffer.
-          Failed texture/slab allocations retry once only after completed empty backing was actually released. Existing active resources are preserved. Logs distinguish actual virtual mapping, physical cap and mesh live/retained/empty/released bytes.
-          Regression checks include 30,000 modeled allocation/retirement/reuse events, physical/virtual budget separation and existing real Foundation archive reads. No full-game iPhone FPS, memory-reduction percentage or confirmed route reproduction is claimed. Compare the same rural drive and graphics after installation; see Install_Guide_ZH.txt. Existing releases remain for rollback, and AI frame generation remains removed.
+          Address-sharded, cache-line-isolated futex queues avoid serializing unrelated engine, asset and graphics waits while retaining exact notification counts, aliasing and timeout semantics. The pinned build21 global implementation and candidate run the same host request/reply workload with alternating ABBA order; raw CPU and throughput measurements are attached.
+          Depth proxies copy only mip/layer subresources exposed by the sampled view and track validity across source writes and object replacement. The CPU fixture and optional Metal pixel/readback probe compare requested content with the original whole-copy path. Host GPU absence is reported as SKIPPED, not as a measured speedup.
+          These are subsystem comparisons, not iPhone game FPS or utilization measurements. Resolution, shadow quality, model counts, engine core policy and physical budgets are retained. Build21 memory/streaming fixes remain. The supplied game mirror was matched by engine hash and rural/vegetation sample checks; no quality-reducing asset conversion or full game repack was applied. AI frame generation stays removed.
+          Install and compare the same scene, graphics, core count and thermal conditions using native-performance.json. See Install_Guide_ZH.txt and docs/A17_EFFICIENCY_NOTES_ZH.md for exact scope and limitations.
           NOTES
           printf '\nSource commit: %s\n' "$BUILD_SOURCE_SHA" >> "$RUNNER_TEMP/release-notes.txt"
-          gh release create "$tag" GTA5Port_1.4.6_b21.ipa IPA-Validation.json A17-Codegen-Validation.json Install_Guide_ZH.txt --repo "${{ github.repository }}" --target "$BUILD_SOURCE_SHA" \
-            --title "Rural Streaming Memory Fix (build 21)" --notes-file "$RUNNER_TEMP/release-notes.txt" --latest=false
+          gh release create "$tag" GTA5Port_1.4.6_b22.ipa IPA-Validation.json A17-Codegen-Validation.json A17-Efficiency-Validation.json Install_Guide_ZH.txt --repo "${{ github.repository }}" --target "$BUILD_SOURCE_SHA" \
+            --title "A17 CPU GPU Efficiency (build 22)" --notes-file "$RUNNER_TEMP/release-notes.txt" --latest=false
 
       - name: Keep the build log if any check fails
         if: failure()
@@ -153,5 +157,6 @@ jobs:
           path: |
             app/Build/xcodebuild.log
             app/Build/local-asset-reads.log
+            A17-Efficiency-Validation.json
           if-no-files-found: ignore
           retention-days: 3

@@ -21,9 +21,9 @@
 	<key>CFBundleShortVersionString</key>
 	<string>1.4.6</string>
 	<key>CFBundleVersion</key>
-	<string>21</string>
+	<string>22</string>
 	<key>PGCustomBuildLabel</key>
-	<string>Rural Streaming Memory Fix</string>
+	<string>A17 CPU GPU Efficiency</string>
 	<key>GCSupportedGameControllers</key>
 	<array>
 		<dict>

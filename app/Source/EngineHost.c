@@ -2961,6 +2961,7 @@ static void *boot(void *ignored) {
   if(limit){char *end;unsigned long mb=strtoul(limit,&end,10);if(end!=limit&&!*end&&mb>=2048&&mb<=8192)simulatedProcessLimit=(uint64_t)mb*1048576;}
 #endif
   if(nativeMemoryGuard)pg_log("Native streaming memory guard enabled with 384 MB of reserve.");
+  pg_log("Native synchronization: independently locked, cache-line-isolated futex queues.");
   // Device A/B switches (GTA-117, GTA-128), named in the log so each run says which side it was.
   if(nativeMemoryGuard&&getenv("PG_GUARD_SPARE_MB"))pg_log("Memory guard A/B: fast nudges only with PG_GUARD_SPARE_MB to spare.");
   if(nativeMemoryGuard&&getenv("PG_GUARD_POOL_ROOM")&&atoi(getenv("PG_GUARD_POOL_ROOM"))==0)pg_log("Memory guard: the resource pool's free space doesn't count as room (PG_GUARD_POOL_ROOM=0).");

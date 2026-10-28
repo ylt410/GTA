@@ -125,8 +125,8 @@ targets:
         # The app folder (logs) is visible in the Files app.
         UIFileSharingEnabled: true
         LSSupportsOpeningDocumentsInPlace: true
-        CFBundleVersion: "21"
-        PGCustomBuildLabel: "Rural Streaming Memory Fix"
+        CFBundleVersion: "22"
+        PGCustomBuildLabel: "A17 CPU GPU Efficiency"
         PGEngineRequiresLSE: true
         PGEngineCodegen: "apple-a11 / tune apple-a17 / LSE"
         UILaunchScreen: {}
