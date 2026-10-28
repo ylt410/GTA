@@ -1743,9 +1743,13 @@ final class NativePortViewController: UIViewController, MTKViewDelegate {
         let settings = GameSettings.shared
         // On a TV the picture takes the TV's shape.
         let surface = tvWindow?.bounds.size ?? view.bounds.size
-        let (width, height) = GraphicsConfiguration.size(for: bootedPreset, renderHeight: settings.renderHeight, screen: surface, matchScreenShape: tvWindow != nil || settings.matchScreenShape)
-        PGSetBackBufferSize(Int32(width), Int32(height))
-        appendLog("Graphics: live resize to \(width)×\(height)")
+        let dimensions = GraphicsConfiguration.renderSize(for: bootedPreset, renderHeight: settings.renderHeight, screen: surface,
+                                                          matchScreenShape: tvWindow != nil || settings.matchScreenShape,
+                                                          mode: settings.superResolutionMode)
+        PGSetSuperResolution(Int32(GraphicsConfiguration.effectiveSuperResolutionMode(settings.superResolutionMode).rawValue),
+                             Int32(dimensions.outputWidth), Int32(dimensions.outputHeight))
+        PGSetBackBufferSize(Int32(dimensions.renderWidth), Int32(dimensions.renderHeight))
+        appendLog("Graphics: live resize to \(dimensions.renderWidth)×\(dimensions.renderHeight), output \(dimensions.outputWidth)×\(dimensions.outputHeight)")
     }
     @objc private func releaseTouchControls() {
         touchControls.reset(publish: false)

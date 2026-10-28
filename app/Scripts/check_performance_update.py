@@ -19,12 +19,15 @@ def main():
     if not cc or not cxx:
         raise SystemExit('A C and C++ compiler are required for the preflight.')
     tests = [
+        ('native_log_filter', cc, 'c11', 'Tests/native_log_filter.c'),
+        ('spatial_upscale_policy', cxx, 'c++17', 'Tests/spatial_upscale_policy.cpp'),
         ('memory_budget', cc, 'c11', 'Tests/memory_budget.c'),
         ('engine_configuration', cc, 'c11', 'Tests/engine_configuration.c'),
         ('packed_asset_cache', cc, 'c11', 'Tests/packed_asset_cache.c'),
         ('packed_asset_migration', cc, 'c11', 'Tests/packed_asset_migration.c'),
         ('local_asset_reader', cc, 'c11', 'Tests/local_asset_reader.c'),
         ('metal_immediate_cache', cxx, 'c++17', 'Tests/metal_immediate_cache.cpp'),
+        ('metal_binding_plan', cxx, 'c++17', 'Tests/metal_binding_plan.cpp'),
         ('constant_upload', cxx, 'c++17', 'Tests/metal_constant_upload.cpp'),
         ('render_target_cache', cxx, 'c++17', 'Tests/metal_render_target_cache.cpp'),
         ('upload_ring_retention', cxx, 'c++20', 'Tests/upload_ring_retention.cpp'),

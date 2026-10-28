@@ -25,6 +25,7 @@ static void pg_mod_test_recheck(void);
 #include <mach/mach.h>
 #include "NativeMemoryBudget.h"
 #include "NativeGraphics.h"
+#include "NativeLogFilter.h"
 #if TARGET_OS_MACCATALYST
 #include <sys/sysctl.h>
 #endif
@@ -85,6 +86,8 @@ static void pg_log_line(const char *message) {
 static pthread_mutex_t logLock = PTHREAD_MUTEX_INITIALIZER;
 static char lastLogLine[512];
 static uint64_t lastLogRepeats;
+static _Atomic uint64_t suppressedRoutineLogLines;
+static _Atomic int fullEngineTrace = -1;
 // The engine's memory pools, from its own "[wasm] region 0x... +N MB" lines: PGLogMemoryPools measures
 // how much of each iOS really holds (mincore), to see where the memory goes.
 static struct { uint64_t base, bytes; } engineRegions[64];
@@ -98,6 +101,18 @@ static void pg_note_region(const char *message) {
 static void pg_note_engine_memory(const char *line);
 static void pg_note_pool_failure(void);
 void pg_log(const char *message) {
+  int trace = atomic_load_explicit(&fullEngineTrace, memory_order_relaxed);
+  if (trace < 0) {
+    int requested = getenv("PG_FULL_ENGINE_TRACE") != NULL;
+    int unset = -1;
+    atomic_compare_exchange_strong_explicit(&fullEngineTrace, &unset, requested,
+                                            memory_order_relaxed, memory_order_relaxed);
+    trace = atomic_load_explicit(&fullEngineTrace, memory_order_relaxed);
+  }
+  if (!trace && pg_native_log_is_routine_noise(message)) {
+    atomic_fetch_add_explicit(&suppressedRoutineLogLines, 1, memory_order_relaxed);
+    return;
+  }
   if (!strncmp(message, "[wasm] region 0x", 16)) pg_note_region(message);
   if (!strncmp(message, "[wasm] mem: malloc arena ", 25)) pg_note_engine_memory(message);	// the address-space guard (GTA-70)
   if (strstr(message, "Failed to allocation virtual memory")) pg_note_pool_failure();	// the pool's free space is in pieces (GTA-128)
@@ -255,6 +270,12 @@ void PGLogMemoryPools(void){
  if(8324232<=size){memcpy(&cpuCopies,data+8324208,8);memcpy(&copies,data+8324216,8);memcpy(&peak,data+8324224,8);}
  if(at<(int)sizeof line-160)snprintf(line+at,sizeof line-at," | pools %lluMB, rest %lluMB, all %lluMB | D3D CPU copies %lluMB (%llu, peak %lluMB) | returned to iOS %lluMB in %llu frees",(unsigned long long)(inRegions>>20),(unsigned long long)((total>inRegions?total-inRegions:0)>>20),(unsigned long long)(total>>20),(unsigned long long)(cpuCopies>>20),(unsigned long long)copies,(unsigned long long)(peak>>20),(unsigned long long)(atomic_load(&heapReturnedBytes)>>20),(unsigned long long)atomic_load(&heapReturnedBlocks));
  pg_log(line);
+ uint64_t suppressed = atomic_exchange_explicit(&suppressedRoutineLogLines, 0, memory_order_relaxed);
+ if (suppressed) {
+  char summary[128];
+  snprintf(summary, sizeof summary, "Log filter: suppressed %llu routine engine trace lines since the previous memory report.", (unsigned long long)suppressed);
+  pg_log(summary);
+ }
 }
 uint64_t PGMemoryBudgetEvictions(void){return atomic_load(&memoryBudgetEvictions);}
 static uint64_t simulatedProcessLimit;

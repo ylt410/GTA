@@ -21,9 +21,9 @@
 	<key>CFBundleShortVersionString</key>
 	<string>1.4.6</string>
 	<key>CFBundleVersion</key>
-	<string>22</string>
+	<string>23</string>
 	<key>PGCustomBuildLabel</key>
-	<string>A17 CPU GPU Efficiency</string>
+	<string>MetalFX Super Resolution + Stability</string>
 	<key>GCSupportedGameControllers</key>
 	<array>
 		<dict>

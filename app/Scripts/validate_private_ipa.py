@@ -20,9 +20,9 @@ with zipfile.ZipFile(args.ipa) as archive:
     if len(infos) != 1:
         raise SystemExit('Expected exactly one app inside Payload.')
     info = plistlib.loads(archive.read(infos[0]))
-    assert info['CFBundleVersion'] == '22', 'Wrong app build number'
+    assert info['CFBundleVersion'] == '23', 'Wrong app build number'
     assert info['CFBundleShortVersionString'] == '1.4.6', 'Unexpected base app version'
-    assert info.get('PGCustomBuildLabel') == 'A17 CPU GPU Efficiency'
+    assert info.get('PGCustomBuildLabel') == 'MetalFX Super Resolution + Stability'
     assert info.get('PGEngineRequiresLSE') is True
     assert info.get('PGEngineCodegen') == 'apple-a11 / tune apple-a17 / LSE'
     app = infos[0].rsplit('/', 1)[0] + '/'
@@ -36,6 +36,10 @@ with zipfile.ZipFile(args.ipa) as archive:
     assert b'mesh slab memory:' in executable, 'Serial-safe mesh backing reclamation missing'
     assert b'Native synchronization: independently locked' in executable, 'Sharded synchronization marker missing'
     assert b'depth proxies since launch:' in executable, 'Demanded depth-copy work tracking missing'
+    assert b'MetalFX spatial super resolution:' in executable, 'Explicit-output super resolution missing'
+    assert b'superResolutionMode' in executable, 'Saved super resolution setting missing'
+    assert b'entity attachment extensions' in executable, 'AttachmentExtension pool repair missing'
+    assert b'Log filter: suppressed' in executable, 'Routine trace filtering missing'
     assert b'logical cores (device %s, %u online, requested %s)' in executable, 'Device core policy log missing'
     magic, cpu, subtype, filetype, ncmds, sizeofcmds, flags, reserved = struct.unpack_from('<8I', executable)
     assert magic == 0xfeedfacf and cpu == 0x100000c and filetype == 2, 'Not an ARM64 device executable'

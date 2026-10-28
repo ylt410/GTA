@@ -12,6 +12,7 @@
 #include "MRFrameReports.h"
 #include "MRGpuFrameTiming.h"
 #include "MRImmediateCache.h"
+#include "MRBindingPlan.h"
 #include "MRConstantUpload.h"
 #include "MRRenderTargetCache.h"
 #include "MRUploadRingRetention.h"
@@ -19,6 +20,7 @@
 #include "MRSerialCompletion.h"
 #include "MRSnapshotOwners.h"
 #include "MRDepthProxyRange.h"
+#include "MRSpatialUpscalePolicy.h"
 #include "BCTextureDecoder.h"
 #include "BC1ToASTC.h"
 #include "NativeGraphics.h"
@@ -275,6 +277,9 @@ struct Renderer {
 	uint64_t commitReasons[4] = {}, skipReasons[8] = {};
 	uint64_t draws = 0, skipped = 0, pendingSkips = 0, clamped = 0, presents = 0, commits = 0;
 	uint64_t immediateBinds = 0, immediateReuses = 0;
+	// ShaderInfo reflection is immutable and owned by the loaded shader library,
+	// so these plans remain valid even when individual game shader objects die.
+	std::unordered_map<ShaderInfo *, BindingPlan> bindingPlans;
 	uint64_t identicalConstantUploads = 0, identicalConstantBytes = 0, identicalTargets = 0;
 	uint64_t depthProxyRequests = 0, depthProxySubresourceCopies = 0, depthProxyTexels = 0, depthProxyFullReferenceTexels = 0;
 	uint64_t ringRetiredBytes = 0;
@@ -1450,10 +1455,18 @@ static Buffer *storageBuffer(int stage, const ResBinding &b, uint32_t &offset) {
 }
 
 // Binds every resource the shader declares; false if the draw must be skipped.
+static const BindingPlan &bindingPlan(ShaderInfo *info) {
+	auto it = R->bindingPlans.find(info);
+	if (it != R->bindingPlans.end()) return it->second;
+	auto plan = BindingPlan::build(info->res, info->arrayLengths, (uint8_t)RSampler);
+	return R->bindingPlans.emplace(info, std::move(plan)).first->second;
+}
 static bool bindStage(int stage, ShaderInfo *info) {
+	const BindingPlan &plan = bindingPlan(info);
 	uint32_t sizes[32] = {};
 	uint32_t texFloatNoFilterSamplers = 0;
-	for (const ResBinding &b : info->res) {
+	for (uint32_t bindingIndex : plan.resources) {
+		const ResBinding &b = info->res[bindingIndex];
 		switch (b.kind) {
 		case RUbo: {
 			if (b.binding == 15) {
@@ -1478,7 +1491,8 @@ static bool bindStage(int stage, ShaderInfo *info) {
 				else setBuffer(stage, R->zeroBuffer, 0, b.index);
 			} else if (buf) { setBuffer(stage, buf->buf, offset, b.index); size = buf->bytes - offset; buf->lastUse = R->serial; }
 			else setBuffer(stage, R->zeroBuffer, 0, b.index);
-			for (auto &al : info->arrayLengths) if (al.first == b.index && al.second < 32) sizes[al.second] = size;
+			if (b.index < plan.sizeIndicesByBuffer.size())
+				for (uint8_t sizeIndex : plan.sizeIndicesByBuffer[b.index]) sizes[sizeIndex] = size;
 			break;
 		}
 		case RSampler: break;		// after the textures (32-bit float fallback)
@@ -1505,8 +1519,8 @@ static bool bindStage(int stage, ShaderInfo *info) {
 		}
 		}
 	}
-	for (const ResBinding &b : info->res) {
-		if (b.kind != RSampler) continue;
+	for (uint32_t bindingIndex : plan.samplers) {
+		const ResBinding &b = info->res[bindingIndex];
 		uint32_t slot = (b.binding - 16) & 15;
 		State *s = state(R->smp[stage][slot]);
 		id<MTLSamplerState> st = nil;
@@ -1515,8 +1529,7 @@ static bool bindStage(int stage, ShaderInfo *info) {
 	}
 	if (info->immediate) {
 		uint32_t block[4 + 32] = {};
-		uint32_t n = 0;
-		for (auto &al : info->arrayLengths) if (al.second < 32) n = std::max(n, al.second + 1);
+		uint32_t n = plan.immediateArrayCount;
 		for (uint32_t i = 0; i < n && i < 32; i++) block[4 + i] = sizes[i];
 		NSUInteger bytes = (16 + n * 4 + 15) & ~15u;
 		StageCache &cache = R->cache[stage];
@@ -1537,8 +1550,8 @@ static bool bindStage(int stage, ShaderInfo *info) {
 // ---- draw ---------------------------------------------------------------------------------------------------------------
 static void applyDynamicState() {
 	const PassInfo &pi = R->passInfo;
+	State *rs = state(R->rsId);
 	if (R->rsId != R->appliedRs) {
-		State *rs = state(R->rsId);
 		if (rs && rs->words.size() >= 8) {
 			const uint32_t *w = rs->words.data();
 			[R->pass setCullMode:w[1] == 2 ? MTLCullModeFront : w[1] == 3 ? MTLCullModeBack : MTLCullModeNone];
@@ -1570,7 +1583,6 @@ static void applyDynamicState() {
 		R->viewportApplied = true;
 		memset(R->appliedViewport, 0, sizeof R->appliedViewport);
 	}
-	State *rs = state(R->rsId);
 	MTLScissorRect sc = {0, 0, pi.width, pi.height};
 	if (rs && rs->words.size() >= 8 && rs->words[7] && R->hasScissor) {
 		uint32_t x0 = std::min(pi.width, R->scissor[0]), y0 = std::min(pi.height, R->scissor[1]);
@@ -1786,12 +1798,14 @@ static void drawInner(const uint32_t *p) {
 	bool foldV = vs->info->vid, foldI = vs->info->iid;
 	uint32_t vFirst = indexed || foldV ? 0 : start, iFirst = foldI ? 0 : startInstance;
 	uint64_t avail[16] = {};
-	for (auto &s : lay->slots) {
-		uint32_t slot = s.first;
+	// Only bind slots consumed by this pipeline's vertex descriptor. A layout
+	// may contain extra streams that the active shader never reads.
+	for (const Pipe::VbReq &s : pipe->vbReq) {
+		uint32_t slot = s.slot;
 		const auto &v = R->vb[slot];
 		Buffer *b = buffer(v.buf);
 		if (!b || !b->buf) { setBuffer(0, R->zeroBuffer, 0, kVertexBufferTop - slot); avail[slot] = R->zeroBuffer.length; continue; }
-		int64_t shift = s.second == 1 ? (foldI ? (int64_t)startInstance * v.stride : 0) : (foldV ? (int64_t)(indexed ? baseVertex : (int32_t)start) * v.stride : 0);
+		int64_t shift = s.instance ? (foldI ? (int64_t)startInstance * v.stride : 0) : (foldV ? (int64_t)(indexed ? baseVertex : (int32_t)start) * v.stride : 0);
 		int64_t off = (int64_t)v.offset + shift;
 		if (off < 0) off = 0;
 		if (off > b->bytes) off = b->bytes;
@@ -2236,20 +2250,46 @@ static void capture(Texture *t, const std::string &name, id<MTLRenderPipelineSta
 	R->onComplete.push_back([out, w, h, bpr, name]() { dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ @autoreleasepool { savePNG(out, w, h, bpr, name); } }); });
 }
 
-// Sharper upscaling (GTA-10): instead of the screen stretching the picture, MetalFX's spatial scaler
-// brings it to the screen's own resolution (up to 3 times the render size) with edge-aware sharpening.
+// Spatial reconstruction has two independent uses: the legacy sharpening toggle,
+// and reduced engine resolution with an explicit output selected by the player.
+// No motion vectors/history or generated frames are used in this path.
 static std::atomic<bool> gUpscale{false};
+static std::atomic<uint64_t> gSpatialConfiguration{0};
 extern "C" void PGMetalRendererSetUpscaling(int on) { gUpscale.store(on != 0); }
+extern "C" void PGMetalRendererSetSuperResolution(int mode, int width, int height) {
+	gSpatialConfiguration.store(spatialUpscaleConfiguration(mode, width, height));
+}
 extern "C" void PGMetalRendererSetPresentInterval(double seconds) { gPresentInterval.store(seconds > 0 && seconds < 1 ? seconds : 0); }
+extern "C" int PGMetalRendererSuperResolutionSupported(void) {
 #if PG_METALFX
-static struct { id<MTLFXSpatialScaler> scaler; id<MTLTexture> out; uint32_t inW, inH, outW, outH; MTLPixelFormat format; bool unsupported; } FX;
+	static const bool supported = [] {
+		id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+		return device && [MTLFXSpatialScalerDescriptor supportsDevice:device];
+	}();
+	return supported ? 1 : 0;
+#else
+	return 0;
+#endif
+}
+#if PG_METALFX
+static struct {
+	id<MTLFXSpatialScaler> scaler; id<MTLTexture> out; id<MTLDevice> device;
+	uint32_t inW, inH, outW, outH; MTLPixelFormat format; bool failed;
+} FX;
 static id<MTLTexture> upscaled(Texture *t) {
-	if (!gUpscale.load() || FX.unsupported || !R->layer) return nil;
-	if (![MTLFXSpatialScalerDescriptor supportsDevice:R->device]) { FX.unsupported = true; pg_log("Sharper upscaling: MetalFX isn't available on this device."); return nil; }
+	const uint64_t config = gSpatialConfiguration.load();
+	const bool legacy = gUpscale.load();
+	if ((!config && !legacy) || !R->layer) { FX = {}; return nil; }
+	if (![MTLFXSpatialScalerDescriptor supportsDevice:R->device]) return nil;
 	CGSize screen = R->layer.bounds.size; CGFloat scale = R->layer.contentsScale;
-	uint32_t outW = (uint32_t)std::min<double>(screen.width * scale, t->width * 3.0), outH = (uint32_t)std::min<double>(screen.height * scale, t->height * 3.0);
-	if (outW < t->width * 1.05 || outH < t->height * 1.05) return nil;		// the picture is already about screen size
-	if (!FX.scaler || FX.inW != t->width || FX.inH != t->height || FX.outW != outW || FX.outH != outH || FX.format != t->tex.pixelFormat) {
+	const auto target = spatialUpscaleTarget(config, legacy, t->width, t->height, screen.width * scale, screen.height * scale);
+	if (!target.width) { FX = {}; return nil; }
+	uint32_t outW = target.width, outH = target.height;
+	const bool different = FX.device != R->device || FX.inW != t->width || FX.inH != t->height ||
+	                       FX.outW != outW || FX.outH != outH || FX.format != t->tex.pixelFormat;
+	if (different) {
+		FX = {}; FX.device = R->device;
+		FX.inW = t->width; FX.inH = t->height; FX.outW = outW; FX.outH = outH; FX.format = t->tex.pixelFormat;
 		MTLFXSpatialScalerDescriptor *d = [MTLFXSpatialScalerDescriptor new];
 		d.inputWidth = t->width; d.inputHeight = t->height; d.outputWidth = outW; d.outputHeight = outH;
 		d.colorTextureFormat = t->tex.pixelFormat; d.outputTextureFormat = t->tex.pixelFormat;
@@ -2259,21 +2299,20 @@ static id<MTLTexture> upscaled(Texture *t) {
 		td.storageMode = MTLStorageModePrivate;
 		td.usage = (FX.scaler ? FX.scaler.outputTextureUsage : 0) | MTLTextureUsageShaderRead;
 		FX.out = FX.scaler ? [R->device newTextureWithDescriptor:td] : nil;
-		FX.inW = t->width; FX.inH = t->height; FX.outW = outW; FX.outH = outH; FX.format = t->tex.pixelFormat;
-		if (!FX.scaler || !FX.out) { FX.unsupported = true; FX.scaler = nil; FX.out = nil; logf("Sharper upscaling: MetalFX couldn't scale format %lu; off.", (unsigned long)t->tex.pixelFormat); return nil; }
-		logf("Sharper upscaling: MetalFX %ux%u to %ux%u.", t->width, t->height, outW, outH);
+		if (!FX.scaler || !FX.out) {
+			FX.failed = true; FX.scaler = nil; FX.out = nil;
+			logf("MetalFX super resolution: unavailable for format %lu; using ordinary display scaling.", (unsigned long)t->tex.pixelFormat);
+		} else logf("MetalFX spatial super resolution: %ux%u to %ux%u (%s).", t->width, t->height, outW, outH,
+		            target.explicitTarget ? "selected output" : "screen sharpening");
 	}
+	if (FX.failed || !FX.scaler || !FX.out) return nil;
 	FX.scaler.colorTexture = t->tex; FX.scaler.outputTexture = FX.out;
 	FX.scaler.inputContentWidth = t->width; FX.scaler.inputContentHeight = t->height;
 	[FX.scaler encodeToCommandBuffer:commandBuffer()];
 	return FX.out;
 }
 #else
-static id<MTLTexture> upscaled(Texture *) {
-	static bool told;
-	if (gUpscale.load() && !told) { told = true; pg_log("Sharper upscaling: MetalFX isn't available on this device."); }
-	return nil;
-}
+static id<MTLTexture> upscaled(Texture *) { return nil; }
 #endif
 
 static void present(uint32_t texId) {

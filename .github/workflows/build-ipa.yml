@@ -1,5 +1,5 @@
 # Owner-authorized public build. Runs automatically when this repository becomes public.
-name: Build IPA (build 22)
+name: Build IPA (build 23)
 
 on:
   public:
@@ -21,7 +21,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: public-ipa-b22-${{ github.repository }}
+  group: public-ipa-b23-${{ github.repository }}
   cancel-in-progress: false
 
 jobs:
@@ -53,8 +53,8 @@ jobs:
       - name: Check actual A17 device compiler output before the engine build
         run: /usr/bin/python3 app/Scripts/check_a17_codegen.py --report A17-Codegen-Validation.json
 
-      - name: Compare synchronization work and validate demanded Metal depth copies
-        run: /usr/bin/python3 app/Scripts/check_a17_efficiency.py --report A17-Efficiency-Validation.json
+      - name: Validate live super resolution, actual config rewrite and binding metadata
+        run: /usr/bin/python3 app/Scripts/check_build23_features.py --report Build23-Feature-Validation.json
 
       - name: Fetch the pinned audio source before generating the engine
         env:
@@ -129,20 +129,20 @@ jobs:
 
       - name: Give this update a distinct filename and include the installation guide
         run: |
-          mv GTA5Port.ipa GTA5Port_1.4.6_b22.ipa
-          cp docs/INSTALL_BUILD_22_ZH.txt Install_Guide_ZH.txt
+          mv GTA5Port.ipa GTA5Port_1.4.6_b23.ipa
+          cp docs/INSTALL_BUILD_23_ZH.txt Install_Guide_ZH.txt
 
       - name: Validate the device IPA before publishing
-        run: /usr/bin/python3 app/Scripts/validate_private_ipa.py GTA5Port_1.4.6_b22.ipa --report IPA-Validation.json
+        run: /usr/bin/python3 app/Scripts/validate_private_ipa.py GTA5Port_1.4.6_b23.ipa --report IPA-Validation.json
 
       - uses: actions/upload-artifact@v4
         with:
-          name: GTA5Port-b22-a17-efficiency
+          name: GTA5Port-b23-spatial-super-resolution
           path: |
-            GTA5Port_1.4.6_b22.ipa
+            GTA5Port_1.4.6_b23.ipa
             IPA-Validation.json
             A17-Codegen-Validation.json
-            A17-Efficiency-Validation.json
+            Build23-Feature-Validation.json
             Install_Guide_ZH.txt
           retention-days: 3
 
@@ -150,18 +150,19 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          tag="native-public-b22-${GITHUB_RUN_ID}"
+          tag="native-public-b23-${GITHUB_RUN_ID}"
           cat > "$RUNNER_TEMP/release-notes.txt" <<'NOTES'
-          A17 CPU/GPU efficiency update, v1.4.6 (build 22).
+          MetalFX spatial super resolution and log-driven stability update, v1.4.6 (build 23).
 
-          Address-sharded, cache-line-isolated futex queues avoid serializing unrelated engine, asset and graphics waits while retaining exact notification counts, aliasing and timeout semantics. The pinned build21 global implementation and candidate run the same host request/reply workload with alternating ABBA order; raw CPU and throughput measurements are attached.
-          Depth proxies copy only mip/layer subresources exposed by the sampled view and track validity across source writes and object replacement. The CPU fixture and optional Metal pixel/readback probe compare requested content with the original whole-copy path. Host GPU absence is reported as SKIPPED, not as a measured speedup.
-          These are subsystem comparisons, not iPhone game FPS or utilization measurements. Resolution, shadow quality, model counts, engine core policy and physical budgets are retained. Build21 memory/streaming fixes remain. The supplied game mirror was matched by engine hash and rural/vegetation sample checks; no quality-reducing asset conversion or full game repack was applied. AI frame generation stays removed.
-          Install and compare the same scene, graphics, core count and thermal conditions using native-performance.json. See Install_Guide_ZH.txt and docs/A17_EFFICIENCY_NOTES_ZH.md for exact scope and limitations.
+          Graphics now contains Off / Quality / Balanced / Performance spatial MetalFX reconstruction. The selected resolution is the output target; the game renders at a lower internal resolution, preserving aspect ratio and a 360-pixel minimum short axis. The saved mode can change live. Unsupported devices keep the original rendering dimensions. This is spatial reconstruction, not AI/temporal reconstruction or frame generation. The older screen-sharpening toggle is bypassed while a super-resolution mode is active.
+          The submitted build22 phone log proved AttachmentExtension exhaustion at 348 entries. The existing in-memory gameconfig overlay now includes a 500-entry minimum, preserving higher custom values; the actual rewrite is compiled and checked for both platform sections, padding and XML validity. This repair adds about 24 KB of entry payload; it is not presented as an FPS optimization or proof of no entity leaks.
+          Renderer binding plans avoid repeated immutable resource/sampler/array-length scans, bind only consumed vertex streams, and reuse raster-state resolution. Routine sonar/audio trace lines are filtered before logging locks and UI work; errors, warnings, pools and performance records remain. Full trace is available via PG_FULL_ENGINE_TRACE.
+          Build23-Feature-Validation.json contains actual sizing/config checks, scoped host binding metadata measurements and an optional MetalFX pixel probe. Unsupported host MetalFX is explicitly SKIPPED. These checks do not measure iPhone gameplay FPS, CPU/GPU utilization or memory reductions. Existing game quality, dispatch unit counts, core policy and build21 memory protections are retained outside the opt-in internal resolution setting.
+          See Install_Guide_ZH.txt for enabling super resolution and comparing the same route/settings on the phone.
           NOTES
           printf '\nSource commit: %s\n' "$BUILD_SOURCE_SHA" >> "$RUNNER_TEMP/release-notes.txt"
-          gh release create "$tag" GTA5Port_1.4.6_b22.ipa IPA-Validation.json A17-Codegen-Validation.json A17-Efficiency-Validation.json Install_Guide_ZH.txt --repo "${{ github.repository }}" --target "$BUILD_SOURCE_SHA" \
-            --title "A17 CPU GPU Efficiency (build 22)" --notes-file "$RUNNER_TEMP/release-notes.txt" --latest=false
+          gh release create "$tag" GTA5Port_1.4.6_b23.ipa IPA-Validation.json A17-Codegen-Validation.json Build23-Feature-Validation.json Install_Guide_ZH.txt --repo "${{ github.repository }}" --target "$BUILD_SOURCE_SHA" \
+            --title "MetalFX Super Resolution + Stability (build 23)" --notes-file "$RUNNER_TEMP/release-notes.txt" --latest=false
 
       - name: Keep the build log if any check fails
         if: failure()
@@ -171,6 +172,6 @@ jobs:
           path: |
             app/Build/xcodebuild.log
             app/Build/local-asset-reads.log
-            A17-Efficiency-Validation.json
+            Build23-Feature-Validation.json
           if-no-files-found: ignore
           retention-days: 3

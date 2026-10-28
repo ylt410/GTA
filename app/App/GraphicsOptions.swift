@@ -194,10 +194,26 @@ enum GraphicsConfiguration {
         return (even(width), even(height))
     }
 
+    /// Chosen output dimensions and the game render dimensions. Super Resolution keeps output
+    /// dimensions fixed while lowering the render input; an output whose shorter axis is below
+    /// 360px is left alone so upscaling never has to enlarge the engine input.
+    static func renderSize(for preset: GraphicsPreset, renderHeight: Int, screen: CGSize, matchScreenShape: Bool,
+                           mode: SuperResolutionMode) -> (renderWidth: Int, renderHeight: Int, outputWidth: Int, outputHeight: Int) {
+        let (outW, outH) = size(for: preset, renderHeight: renderHeight, screen: screen, matchScreenShape: matchScreenShape)
+        let dimensions = SpatialSuperResolution.dimensions(outputWidth: outW, outputHeight: outH,
+                                                           mode: mode, supported: PGSuperResolutionSupported() != 0)
+        return (dimensions.renderWidth, dimensions.renderHeight, dimensions.outputWidth, dimensions.outputHeight)
+    }
+
+    static func effectiveSuperResolutionMode(_ mode: SuperResolutionMode) -> SuperResolutionMode {
+        PGSuperResolutionSupported() != 0 ? mode : .off
+    }
+
     /// Pass the chosen settings to the engine. Call before PGStartEngine.
     static func apply(_ settings: GameSettings, screen: CGSize, tv: Bool = false) -> String {
         let preset = settings.graphicsPreset
-        let (width, height) = size(for: preset, renderHeight: settings.renderHeight, screen: screen, matchScreenShape: tv || settings.matchScreenShape)
+        let dimensions = renderSize(for: preset, renderHeight: settings.renderHeight, screen: screen,
+                                    matchScreenShape: tv || settings.matchScreenShape, mode: settings.superResolutionMode)
         // The player's own details replace the preset's (GTA-84).
         let overrides = settings.graphicsOverrides
         let options = preset.engineOptions.map { option -> String in
@@ -225,14 +241,16 @@ enum GraphicsConfiguration {
             setenv("PG_ENGINE_CORES", String(settings.engineCoreCount), 1)
         }
         PGSetSharperUpscaling(settings.sharperUpscaling ? 1 : 0)
+        PGSetSuperResolution(Int32(PGSuperResolutionSupported() != 0 ? settings.superResolutionMode.rawValue : 0),
+                             Int32(dimensions.outputWidth), Int32(dimensions.outputHeight))
         PGSetPresentInterval(GameSettings.presentInterval(settings.frameRateCap))
         var pointers = options.map { strdup($0) }
         defer { pointers.forEach { free($0) } }
         pointers.withUnsafeMutableBufferPointer { buffer in
             buffer.baseAddress!.withMemoryRebound(to: UnsafePointer<CChar>?.self, capacity: buffer.count) {
-                PGConfigureEngine($0, UInt32(buffer.count), Int32(width), Int32(height), GameSettings.engineFrameLimit(settings.frameRateCap))
+                PGConfigureEngine($0, UInt32(buffer.count), Int32(dimensions.renderWidth), Int32(dimensions.renderHeight), GameSettings.engineFrameLimit(settings.frameRateCap))
             }
         }
-        return "\(preset.title) \(width)×\(height) at \(GameSettings.frameRateTitle(settings.frameRateCap))" + (own.isEmpty ? "" : ", own settings: " + own.joined(separator: ", "))
+        return "\(preset.title) \(dimensions.renderWidth)×\(dimensions.renderHeight) at \(GameSettings.frameRateTitle(settings.frameRateCap))" + (own.isEmpty ? "" : ", own settings: " + own.joined(separator: ", "))
     }
 }

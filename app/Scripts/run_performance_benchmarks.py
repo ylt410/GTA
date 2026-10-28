@@ -33,7 +33,7 @@ def main():
         'created_utc': datetime.datetime.now(datetime.timezone.utc).isoformat(),
         'environment': {'system': platform.system(), 'release': platform.release(),
                         'machine': platform.machine(), 'compiler': compiler, 'optimization': '-O2'},
-        'baseline': 'The build-17 source paths with frame generation OFF; isolated algorithm replay, not a full-game run.',
+        'baseline': 'Per-workload original source paths; binding metadata follows the build22 loop. Isolated algorithm replay, not a full-game run.',
         'whole_game': {'tested': False, 'cpu_reduction_percent': None, 'gpu_reduction_percent': None,
                        'memory_reduction_percent': None,
                        'reason': 'No user iPhone or complete locally runnable game data is attached. Host microbenchmarks cannot establish these numbers.'},
@@ -43,6 +43,7 @@ def main():
         work = Path(directory)
         for name, source, extra in [
             ('constant_upload', 'Tests/benchmark_constant_upload.cpp', []),
+            ('binding_plan', 'Tests/benchmark_binding_plan.cpp', []),
             ('upload_ring_retention', 'Tests/upload_ring_retention.cpp', ['--benchmark']),
         ]:
             executable = work / name

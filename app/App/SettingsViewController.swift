@@ -159,7 +159,7 @@ final class SettingsViewController: UITableViewController {
         switch sectionKind(section) {
         // While the game runs, settings that only take effect at the next start are hidden.
         case .mode: return engineRunning ? 0 : importSaveRow + 1
-        case .graphics: return engineRunning ? Self.liveGraphicsRows.count : settings.tier.allowed.count + 8 + GraphicsDetail.all.count
+        case .graphics: return engineRunning ? Self.liveGraphicsRows.count : settings.tier.allowed.count + 9 + GraphicsDetail.all.count
         case .controls: return controlsRows.count
         case .cheats: return engineRunning ? StoryCheats.all.count + storyCheatStart : 0
         case .gyro: return (settings.gyroAim == .off ? 1 : 3) + (settings.tiltSteer == .off ? 1 : 2)
@@ -183,8 +183,8 @@ final class SettingsViewController: UITableViewController {
     }
 
     /// Graphics rows that act during play: resolution, fill the screen, FPS counter, steady when hot,
-    /// sharper upscaling (row numbers after the presets). Presets and the frame rate apply at the next start.
-    private static let liveGraphicsRows = [0, 1, 3, 4, 6]
+    /// sharper upscaling and MetalFX Super Resolution (row numbers after the presets).
+    private static let liveGraphicsRows = [0, 1, 3, 4, 6, 7]
 
     override func tableView(_ tableView: UITableView, titleForFooterInSection section: Int) -> String? {
         if engineRunning, [.mode, .files].contains(sectionKind(section)) { return nil }
@@ -287,7 +287,7 @@ final class SettingsViewController: UITableViewController {
                     cell.accessoryView = toggle(settings.matchScreenShape, label: AppLanguage.choose("Fill the screen")) { [weak self] in
                         self?.settings.matchScreenShape = $0; self?.resolutionChanged?(); self?.tableView.reloadData()
                     }
-                } else if row == 7 + GraphicsDetail.all.count {
+                } else if row == 8 + GraphicsDetail.all.count {
                     content.text = AppLanguage.choose("Engine parallelism")
                     content.secondaryText = AppLanguage.choose("Auto uses 2 logical cores. Keep 4 or 6 available to compare CPU parallelism. Close and reopen the app after changing this setting.")
                     let button = UIButton(type: .system)
@@ -302,9 +302,9 @@ final class SettingsViewController: UITableViewController {
                     })
                     button.sizeToFit()
                     cell.accessoryView = button
-                } else if row >= 7, row - 7 < GraphicsDetail.all.count {
+                } else if row >= 8, row - 8 < GraphicsDetail.all.count {
                     // The player's own details over the preset (GTA-84): kept when the preset changes.
-                    let detail = GraphicsDetail.all[row - 7]
+                    let detail = GraphicsDetail.all[row - 8]
                     let presetValue = detail.presetValue(settings.graphicsPreset)
                     let own = settings.graphicsOverrides[detail.option]
                     content.text = detail.title
@@ -325,10 +325,37 @@ final class SettingsViewController: UITableViewController {
                     cell.accessoryView = button
                 } else if row == 6 {
                     content.text = AppLanguage.choose("Sharper upscaling")
-                    content.secondaryText = AppLanguage.choose("MetalFX brings the picture to the screen's resolution with sharpening instead of stretching it. Uses a little more battery.")
-                    cell.accessoryView = toggle(settings.sharperUpscaling, label: AppLanguage.choose("Sharper upscaling")) { [weak self] in
+                    let superResolution = GraphicsConfiguration.effectiveSuperResolutionMode(settings.superResolutionMode)
+                    content.secondaryText = superResolution.isEnabled
+                        ? AppLanguage.choose("Ignored while MetalFX Super Resolution is on.")
+                        : AppLanguage.choose("MetalFX brings the picture to the screen's resolution with sharpening instead of stretching it. Uses a little more battery.")
+                    let control = toggle(settings.sharperUpscaling, label: AppLanguage.choose("Sharper upscaling")) { [weak self] in
                         self?.settings.sharperUpscaling = $0
                     }
+                    control.isEnabled = !superResolution.isEnabled
+                    cell.accessoryView = control
+                } else if row == 7 {
+                    content.text = AppLanguage.choose("MetalFX Super Resolution")
+                    content.secondaryText = AppLanguage.choose("Spatial upscaling renders below the selected resolution and scales to it. Lower input resolution may improve performance; results vary by scene and device.")
+                    let supported = PGSuperResolutionSupported() != 0
+                    let button = UIButton(type: .system)
+                    let effectiveMode = GraphicsConfiguration.effectiveSuperResolutionMode(settings.superResolutionMode)
+                    button.setTitle(effectiveMode.title + " ▾", for: .normal)
+                    button.showsMenuAsPrimaryAction = true
+                    button.accessibilityLabel = AppLanguage.choose("MetalFX Super Resolution")
+                    button.isEnabled = supported
+                    button.menu = UIMenu(children: SuperResolutionMode.allCases.map { mode in
+                        UIAction(title: mode.title, attributes: mode != .off && !supported ? .disabled : [],
+                                 state: mode == effectiveMode ? .on : .off) { [weak self] _ in
+                            guard let self else { return }
+                            self.settings.superResolutionMode = mode
+                            self.resolutionChanged?()
+                            self.tableView.reloadData()
+                        }
+                    })
+                    button.sizeToFit()
+                    cell.accessoryView = button
+                    if !supported { content.secondaryText = AppLanguage.choose("MetalFX spatial upscaling is unavailable on this device.") }
                 } else if row == 3 {
                     content.text = AppLanguage.choose("Show FPS counter")
                     cell.accessoryView = toggle(settings.showFPS, label: AppLanguage.choose("Show FPS counter")) { [weak self] in
@@ -947,9 +974,12 @@ final class SettingsViewController: UITableViewController {
 
     private func currentSizeText() -> String {
         let screen = view.window?.windowScene?.screen.bounds.size ?? UIScreen.main.bounds.size
-        let (w, h) = GraphicsConfiguration.size(for: engineRunning ? bootPreset : settings.graphicsPreset, renderHeight: settings.renderHeight,
-                                                screen: screen, matchScreenShape: settings.matchScreenShape)
-        return AppLanguage.interpolate(AppLanguage.choose("Renders at {arg0}×{arg1}"), [String(describing: w), String(describing: h)])
+        let dimensions = GraphicsConfiguration.renderSize(for: engineRunning ? bootPreset : settings.graphicsPreset, renderHeight: settings.renderHeight,
+                                                          screen: screen, matchScreenShape: settings.matchScreenShape,
+                                                          mode: settings.superResolutionMode)
+        let input = AppLanguage.interpolate(AppLanguage.choose("Renders at {arg0}×{arg1}"), [String(describing: dimensions.renderWidth), String(describing: dimensions.renderHeight)])
+        guard dimensions.outputWidth != dimensions.renderWidth || dimensions.outputHeight != dimensions.renderHeight else { return input }
+        return input + AppLanguage.interpolate(AppLanguage.choose(" · output {arg0}×{arg1}"), [String(describing: dimensions.outputWidth), String(describing: dimensions.outputHeight)])
     }
     /// Uploads the logs after the player confirms, with an optional note (its own screen, so the
     /// keyboard never covers Send in landscape).

@@ -15,6 +15,10 @@ int PGTextureRatioPercent(void);
 void PGNoteTextureRatio(int64_t gpuBytes, int64_t gameBytes);
 // Settings › Sharper upscaling: MetalFX scales the picture to the screen's resolution (changes live).
 void PGSetSharperUpscaling(int on);
+// MetalFX spatial super resolution: 0 off, 1 quality, 2 balanced, 3 performance.
+// The app configures a reduced engine input and an explicit reconstruction target.
+int PGSuperResolutionSupported(void);
+void PGSetSuperResolution(int mode, int outputWidth, int outputHeight);
 // Frame rate 40 (ProMotion screens): each picture stays up at least this long; 0 for the other frame rates.
 void PGSetPresentInterval(double seconds);
 // Thread-safe request; the renderer only trims unused backing after GPU completion.

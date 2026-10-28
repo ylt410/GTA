@@ -230,6 +230,11 @@ final class GameSettings {
         get { defaults.bool(forKey: "sharperUpscaling") }
         set { defaults.set(newValue, forKey: "sharperUpscaling"); PGSetSharperUpscaling(newValue ? 1 : 0) }
     }
+    /// Spatial MetalFX upscaling mode. Kept off by default; older installs retain their existing settings.
+    var superResolutionMode: SuperResolutionMode {
+        get { SuperResolutionMode(rawValue: defaults.integer(forKey: "superResolutionMode")) ?? .off }
+        set { defaults.set(newValue.rawValue, forKey: "superResolutionMode") }
+    }
     /// This device › Experimental (v1.4.3, on by default): improvements that player logs still have to confirm,
     /// each with a switch to turn it off. Read by the engine and renderer, so they apply when the app starts.
     var smarterTextureLoading: Bool {   // GTA-128: grey ground after long play
@@ -465,5 +470,16 @@ final class GameSettings {
         bootPending = false
         lastGoodPreset = graphicsPreset
         defaults.set(renderHeight == 0 ? graphicsPreset.height : renderHeight, forKey: "lastGoodRenderHeight")
+    }
+}
+
+extension SuperResolutionMode {
+    var title: String {
+        switch self {
+        case .off: return AppLanguage.choose("Off")
+        case .quality: return AppLanguage.choose("Quality")
+        case .balanced: return AppLanguage.choose("Balanced")
+        case .performance: return AppLanguage.choose("Performance")
+        }
     }
 }

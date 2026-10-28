@@ -819,9 +819,12 @@ static void controlMetaOverlay(uint32_t id,uint64_t offset,uint8_t *destination,
 //   at slot 899 (logs 619, 716, 721, 882). The files this was tested with say 1400 and register about 1030.
 // - CScenarioInfo: 220, filled by add-on packs with scenarios (log 948).
 // - phInstGta: physics instances; the pc section's 8192 filled with no mods at all, driving in a mission (log 895).
+// - AttachmentExtension: build22 device log filled all 348 entries during play. RDE's matching gameconfig uses
+//   500 after the same failure. The extra 152 fixed 160-byte slots take about 24 KB, not a larger physical heap.
 static const struct { const char *pool, *what; long minimum; } pgGamePools[] = {
   {"HandlingData", "vehicle handling entries", 3000}, {"ScriptStore", "scripts", 1500},
   {"CScenarioInfo", "scenario types", 400}, {"phInstGta", "physics instances", 12288},
+  {"AttachmentExtension", "entity attachment extensions", 500},
 };
 static NSData *gameConfig;
 NSData *PGGameConfigRewrite(NSData *original,NSString *pool,long minimum,long *was){

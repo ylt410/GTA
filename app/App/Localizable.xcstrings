@@ -36866,6 +36866,121 @@
         }
       }
     },
+    "MetalFX Super Resolution": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "MetalFX Super Resolution"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "MetalFX 超分辨率"
+          }
+        },
+        "zh-Hant": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "MetalFX 超解析度"
+          }
+        }
+      }
+    },
+    "Spatial upscaling renders below the selected resolution and scales to it. Lower input resolution may improve performance; results vary by scene and device.": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Spatial upscaling renders below the selected resolution and scales to it. Lower input resolution may improve performance; results vary by scene and device."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "空间升频会以低于所选分辨率的输入渲染，再升至所选分辨率。降低输入分辨率可能提升性能；效果因场景和设备而异。"
+          }
+        },
+        "zh-Hant": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "空間升頻會以低於所選解析度的輸入進行渲染，再升至所選解析度。降低輸入解析度可能提升效能；效果因場景和裝置而異。"
+          }
+        }
+      }
+    },
+    "Ignored while MetalFX Super Resolution is on.": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Ignored while MetalFX Super Resolution is on."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "MetalFX 超分辨率开启时，此设置会被忽略。"
+          }
+        },
+        "zh-Hant": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "MetalFX 超解析度開啟時，會忽略此設定。"
+          }
+        }
+      }
+    },
+    "MetalFX spatial upscaling is unavailable on this device.": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "MetalFX spatial upscaling is unavailable on this device."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "此设备不支持 MetalFX 空间升频。"
+          }
+        },
+        "zh-Hant": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "此裝置不支援 MetalFX 空間升頻。"
+          }
+        }
+      }
+    },
+    " · output {arg0}×{arg1}": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": " · output {arg0}×{arg1}"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": " · 输出 {arg0}×{arg1}"
+          }
+        },
+        "zh-Hant": {
+          "stringUnit": {
+            "state": "translated",
+            "value": " · 輸出 {arg0}×{arg1}"
+          }
+        }
+      }
+    },
     "MetalFX brings the picture to the screen's resolution with sharpening instead of stretching it. Uses a little more battery.": {
       "extractionState": "manual",
       "localizations": {
