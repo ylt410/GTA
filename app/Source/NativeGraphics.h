@@ -17,6 +17,8 @@ void PGNoteTextureRatio(int64_t gpuBytes, int64_t gameBytes);
 void PGSetSharperUpscaling(int on);
 // Frame rate 40 (ProMotion screens): each picture stays up at least this long; 0 for the other frame rates.
 void PGSetPresentInterval(double seconds);
+// Thread-safe request; the renderer only trims unused backing after GPU completion.
+void PGRequestRendererMemoryReclaim(void);
 #ifdef __cplusplus
 }
 #endif

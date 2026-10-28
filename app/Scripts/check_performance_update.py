@@ -32,6 +32,7 @@ def main():
         ('frame_metrics', cxx, 'c++17', 'Tests/frame_metrics.cpp'),
         ('gpu_frame_timing', cxx, 'c++17', 'Tests/gpu_frame_timing.cpp'),
         ('renderer_completion_owners', cxx, 'c++17', 'Tests/renderer_completion_owners.cpp'),
+        ('mesh_slab_allocator', cxx, 'c++17', 'Tests/metal_mesh_slab_allocator.cpp'),
     ]
     with tempfile.TemporaryDirectory(prefix='fanport-preflight-') as work:
         for name, compiler, standard, source in tests:

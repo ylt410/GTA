@@ -2,6 +2,26 @@
 #include <assert.h>
 #include <stdio.h>
 int main(void){
+ PGEngineMemoryPolicy p=pg_engine_memory_policy(6144,5120,0);
+ assert(p.physicalLimitMB==6144&&p.physicalCapMB==5120&&p.engineReservationMB==5120);
+ // Before the split, applying the 5120 MB physical cap first selected 4096 MB virtual.
+ assert((p.physicalLimitMB-1024)==5120&&p.engineReservationMB!=(p.physicalCapMB-1024));
+ p=pg_engine_memory_policy(6144,4096,0);
+ assert(p.physicalLimitMB==6144&&p.physicalCapMB==4096&&p.engineReservationMB==5120);
+ p=pg_engine_memory_policy(6144,0,0);
+ assert(p.physicalCapMB==6144&&p.engineReservationMB==5120);
+ p=pg_engine_memory_policy(4096,3072,0);
+ assert(p.physicalLimitMB==4096&&p.physicalCapMB==3072&&p.engineReservationMB==4095);
+ p=pg_engine_memory_policy(0,2048,0);
+ assert(p.physicalLimitMB==0&&p.physicalCapMB==0&&p.engineReservationMB==4095);
+ p=pg_engine_memory_policy(0,2048,6144);
+ assert(p.physicalCapMB==0&&p.engineReservationMB==6144);
+ p=pg_engine_memory_policy(UINT64_MAX,UINT64_MAX-1,0);
+ assert(p.physicalLimitMB==UINT64_MAX&&p.physicalCapMB==UINT64_MAX-1&&p.engineReservationMB==7168);
+ p=pg_engine_memory_policy(6144,5120,8192);
+ assert(p.physicalCapMB==5120&&p.engineReservationMB==8192);
+ p=pg_engine_memory_policy(6144,5120,1023);
+ assert(p.physicalCapMB==5120&&p.engineReservationMB==5120);
  assert(pg_streaming_headroom_budget(1000,2000,384,0)==1000);
  assert(pg_streaming_headroom_budget(1000,600,384,0)==216);
  assert(pg_streaming_headroom_budget(1000,384,384,0)==0);

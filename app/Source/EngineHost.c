@@ -24,6 +24,7 @@ static void pg_mod_test_recheck(void);
 #include <os/proc.h>
 #include <mach/mach.h>
 #include "NativeMemoryBudget.h"
+#include "NativeGraphics.h"
 #if TARGET_OS_MACCATALYST
 #include <sys/sysctl.h>
 #endif
@@ -302,6 +303,8 @@ static uint64_t engineAddressHeadroom(void){
  if(poolRoom&&room>=region&&pool>region&&timeMS(CLOCK_MONOTONIC)-atomic_load(&poolFailedAt)>60000)room+=pool-region;
  return room;
 }
+static uint64_t guardReserve(void);
+static uint64_t guardBand(void);
 static bool nativeProcessHeadroom(uint64_t *headroom){
  if(!nativeMemoryGuard)return false;
  atomic_fetch_add(&memoryBudgetQueries,1);
@@ -318,6 +321,12 @@ static bool nativeProcessHeadroom(uint64_t *headroom){
  available=PGProcessAvailableMemory();
  available=available>capReserveBytes?available-capReserveBytes:0;
 #endif
+ // Ask the renderer to return completed, empty mesh slabs before the physical
+ // guard stalls streaming. Reuse the existing headroom sample, respect the
+ // player's cap, and leave active/in-flight resources untouched.
+ uint64_t reserve=guardReserve(),band=guardBand();
+ uint64_t grow=reserve>UINT64_MAX-band?UINT64_MAX:reserve+band;
+ if(available<grow)PGRequestRendererMemoryReclaim();
  uint64_t engine=engineAddressHeadroom();
  // The fast nudges (guardNudge) are for phones with memory to spare beyond the engine's room (8 GB:
  // about 2 GB more). On 5-6 GB phones the two sit within ~100 MB of each other (v1.4.1 logs: median
@@ -440,21 +449,32 @@ uint64_t pg_streaming_resource_memory(uint64_t engineAvailable){
 void PGSetMemoryCap(int mb) { if (!atomic_load(&started)) memoryCapMB = mb > 0 ? (uint64_t)mb : 0; }
 static uint64_t pg_engine_memory_mb(void){
  const char *configured=getenv("PG_ENGINE_MEMORY_MB");
- if(configured){long mb=atol(configured);if(mb>=1024&&mb<=8192)return (uint64_t)mb;}
+ uint64_t overrideMB=0;
+ if(configured){long mb=atol(configured);if(mb>=1024&&mb<=8192)overrideMB=(uint64_t)mb;}
+ uint64_t physicalLimitMB=0;
 #if !TARGET_OS_SIMULATOR
  task_vm_info_data_t info={};mach_msg_type_number_t count=TASK_VM_INFO_COUNT;
  if(task_info(mach_task_self(),TASK_VM_INFO,(task_info_t)&info,&count)==KERN_SUCCESS){
-  uint64_t limitMB=(PGProcessAvailableMemory()+info.phys_footprint)>>20;
-  if(memoryCapMB&&memoryCapMB<limitMB){
-   capReserveBytes=(limitMB-memoryCapMB)<<20; // headroom the guard leaves unused
-   char line[96];snprintf(line,sizeof line,"Memory cap: %llu MB of the %llu MB limit.",(unsigned long long)memoryCapMB,(unsigned long long)limitMB);pg_log(line);
-   limitMB=memoryCapMB;
-  }
-  processLimitMB=limitMB;
-  if(limitMB>4095+1024)return limitMB-1024<7168?limitMB-1024:7168;
+  uint64_t available=PGProcessAvailableMemory();
+  uint64_t total=available>UINT64_MAX-info.phys_footprint?UINT64_MAX:available+info.phys_footprint;
+  physicalLimitMB=total>>20;
  }
 #endif
- return 4095;
+ PGEngineMemoryPolicy policy=pg_engine_memory_policy(physicalLimitMB,memoryCapMB,overrideMB);
+ processLimitMB=policy.physicalCapMB;
+ if(policy.physicalLimitMB&&policy.physicalCapMB<policy.physicalLimitMB){
+  uint64_t reserved=policy.physicalLimitMB-policy.physicalCapMB;
+  capReserveBytes=reserved>UINT64_MAX>>20?UINT64_MAX:reserved<<20;
+ }
+ char line[192];
+ if(policy.physicalLimitMB)
+  snprintf(line,sizeof line,"Memory policy: physical cap %llu MB of %llu MB device limit; engine virtual reservation %llu MB.",
+           (unsigned long long)policy.physicalCapMB,(unsigned long long)policy.physicalLimitMB,(unsigned long long)policy.engineReservationMB);
+ else
+  snprintf(line,sizeof line,"Memory policy: physical limit unavailable; engine virtual reservation %llu MB.",
+           (unsigned long long)policy.engineReservationMB);
+ pg_log(line);
+ return policy.engineReservationMB;
 }
 // The adapter's video memory as the engine reads it (Scripts/prepare_video_memory.py). The
 // browser build reports about 4 GB on every device, so the engine streams textures as if a phone
@@ -2995,6 +3015,7 @@ static void *boot(void *ignored) {
     allocation=mmap(NULL,capacity+guardBytes,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANON,-1,0);
   }
   if (allocation==MAP_FAILED) { pg_log("iOS could not reserve the engine memory."); return NULL; }
+  {char line[112];snprintf(line,sizeof line,"Engine virtual mapping: %llu MB reserved; startup heap 3328 MB.",(unsigned long long)(capacity>>20));pg_log(line);}
   if (mprotect((uint8_t *)allocation+capacity,guardBytes,PROT_NONE)) pg_log("Engine memory guard region could not be protected.");
   env.memory.data=(_Atomic volatile uint8_t *)allocation;
 #if TARGET_OS_SIMULATOR

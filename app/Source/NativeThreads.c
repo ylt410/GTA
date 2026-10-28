@@ -1,5 +1,6 @@
 #include "HostInternal.h"
 #include "wasm-rt-impl.h"
+#include "NativeGraphics.h"
 #include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
@@ -80,6 +81,10 @@ u32 w2c_env_emscripten_resize_heap(struct w2c_env *host,u64 desired){
     // The imported module instances share this memory descriptor. Its backing
     // mapping and the renderer's external ArrayBuffer remain at the same address.
     memory->pages=pages;memory->size=pages*memory->page_size;success=1;
+    // Real allocations can grow without first asking the streaming guard.
+    // Request completed-only renderer cleanup; never turn a valid allocation
+    // into a fatal NULL result by refusing growth on physical-budget grounds.
+    PGRequestRendererMemoryReclaim();
     char line[160];snprintf(line,sizeof line,"Native heap grew from %llu to %llu MB within the shared reservation.",previous/1048576,memory->size/1048576);pg_log(line);
   }else{
     uint64_t count=++refused;

@@ -1,5 +1,5 @@
 # Owner-authorized public build. Runs automatically when this repository becomes public.
-name: Build IPA (build 20)
+name: Build IPA (build 21)
 
 on:
   public:
@@ -21,7 +21,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: public-ipa-b20-${{ github.repository }}
+  group: public-ipa-b21-${{ github.repository }}
   cancel-in-progress: false
 
 jobs:
@@ -112,17 +112,17 @@ jobs:
 
       - name: Give this update a distinct filename and include the installation guide
         run: |
-          mv GTA5Port.ipa GTA5Port_1.4.6_b20.ipa
-          cp docs/INSTALL_BUILD_20_ZH.txt Install_Guide_ZH.txt
+          mv GTA5Port.ipa GTA5Port_1.4.6_b21.ipa
+          cp docs/INSTALL_BUILD_21_ZH.txt Install_Guide_ZH.txt
 
       - name: Validate the device IPA before publishing
-        run: /usr/bin/python3 app/Scripts/validate_private_ipa.py GTA5Port_1.4.6_b20.ipa --report IPA-Validation.json
+        run: /usr/bin/python3 app/Scripts/validate_private_ipa.py GTA5Port_1.4.6_b21.ipa --report IPA-Validation.json
 
       - uses: actions/upload-artifact@v4
         with:
-          name: GTA5Port-b20-performance-batch
+          name: GTA5Port-b21-rural-memory
           path: |
-            GTA5Port_1.4.6_b20.ipa
+            GTA5Port_1.4.6_b21.ipa
             IPA-Validation.json
             A17-Codegen-Validation.json
             Install_Guide_ZH.txt
@@ -132,19 +132,18 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          tag="native-public-b20-${GITHUB_RUN_ID}"
+          tag="native-public-b21-${GITHUB_RUN_ID}"
           cat > "$RUNNER_TEMP/release-notes.txt" <<'NOTES'
-          Native performance batch, v1.4.6 (build 20).
+          Rural streaming memory fix, v1.4.6 (build 21).
 
-          This batch fixes several paths together: GPU completion notifications no longer accumulate stale semaphore tokens; completed callback prefixes protect visibility/readback finalizers; upload-ring retirement visits actual constant-snapshot owners rather than the full object table; chunked loose mod resources reuse file leases while one-shot resources avoid polluting the 64-entry demand cache; local resource hints use bounded advisory readahead instead of copied-and-discarded reads.
-          CPU parallelism remains selectable at 2/4/6 logical cores. Auto uses the original 2-core profile after the build-19 pacing regression, whose cause was not isolated. Explicit 4/6 choices are retained. LSE atomics and A17 tuning are retained, along with the A11+ launch guard and unchanged floating-point rules.
-          Local performance windows are automatic: source-frame p50/p95/p99/max, long frames, CPU time per source frame, grouped all-command GPU samples, drawable/fence/retirement waits, footprint and thermal state. The latest native-performance.json is overwritten, and a compact snapshot goes into the bounded game log. No remote reporting is enabled by default. GPU completion windows can lag CPU windows; their frame counts and invalid timestamp counts are recorded separately.
-          Concurrency, object lifetime, real Foundation mod/archive reads, one-shot cache admission and advisory range semantics are checked before the expensive engine compilation. Tests establish correctness and removal of unnecessary operations, not actual iPhone FPS gains. Whole-game FPS/CPU/GPU/memory deltas remain unmeasured without paired device runs.
-          Verify v1.4.6 (20). For an isolated comparison against build 19, select the same core count and graphics in both builds; changing Auto from 4 to 2 is a separate variable. Existing releases remain available for rollback. AI frame generation remains removed.
+          Keep the player's physical memory cap, while choosing the virtual engine reservation from the actual device allowance. The 6144 MB device / 5120 MB physical-cap case now reserves 5120 MB virtual rather than 4096 MB; mapping fallback and physical streaming/video budgets remain enforced.
+          Release wholly empty mesh slab backing only after its GPU completion serial. Stable sparse IDs and delayed ranges prevent reuse of in-flight data. Normal frame retirement keeps a small warm floor; the existing memory guard, real heap growth and iOS warnings request earlier completed-only reclamation. Allocation paths collect pending frees without scanning all backing for trim on every buffer.
+          Failed texture/slab allocations retry once only after completed empty backing was actually released. Existing active resources are preserved. Logs distinguish actual virtual mapping, physical cap and mesh live/retained/empty/released bytes.
+          Regression checks include 30,000 modeled allocation/retirement/reuse events, physical/virtual budget separation and existing real Foundation archive reads. No full-game iPhone FPS, memory-reduction percentage or confirmed route reproduction is claimed. Compare the same rural drive and graphics after installation; see Install_Guide_ZH.txt. Existing releases remain for rollback, and AI frame generation remains removed.
           NOTES
           printf '\nSource commit: %s\n' "$BUILD_SOURCE_SHA" >> "$RUNNER_TEMP/release-notes.txt"
-          gh release create "$tag" GTA5Port_1.4.6_b20.ipa IPA-Validation.json A17-Codegen-Validation.json Install_Guide_ZH.txt --repo "${{ github.repository }}" --target "$BUILD_SOURCE_SHA" \
-            --title "Native Performance Batch (build 20)" --notes-file "$RUNNER_TEMP/release-notes.txt" --latest=false
+          gh release create "$tag" GTA5Port_1.4.6_b21.ipa IPA-Validation.json A17-Codegen-Validation.json Install_Guide_ZH.txt --repo "${{ github.repository }}" --target "$BUILD_SOURCE_SHA" \
+            --title "Rural Streaming Memory Fix (build 21)" --notes-file "$RUNNER_TEMP/release-notes.txt" --latest=false
 
       - name: Keep the build log if any check fails
         if: failure()

@@ -15,6 +15,7 @@
 #include "MRConstantUpload.h"
 #include "MRRenderTargetCache.h"
 #include "MRUploadRingRetention.h"
+#include "MRMeshSlabAllocator.h"
 #include "MRSerialCompletion.h"
 #include "MRSnapshotOwners.h"
 #include "BCTextureDecoder.h"
@@ -64,10 +65,12 @@ static uint64_t pageRound(uint64_t n) { return (n + 16383) & ~16383ull; }
 // the game's ~8k vertex and index buffers hold a few KB: about 100 MB went to rounding at a 2.3 GB limit.
 // A freed range is reused only once the GPU has finished every command buffer that could still read it.
 // PG_BUFFER_SLABS=0 gives every buffer its own MTLBuffer again.
-struct Slab { id<MTLBuffer> buf; std::map<uint32_t, uint32_t> free; };		// offset -> length
+struct Slab { id<MTLBuffer> buf; };
 static std::vector<Slab> gSlabs;
-struct SlabFree { uint64_t serial; int32_t slab; uint32_t off, len; };
-static std::vector<SlabFree> gSlabPending;
+static MeshSlabAllocator gSlabAllocator(4 << 20);
+static std::atomic<bool> gMemoryPressure{false};
+static uint64_t gTextureReclaimsRecovered = 0;
+extern "C" void PGRequestRendererMemoryReclaim(void) { gMemoryPressure.store(true); }
 static const uint32_t kSlabBytes = 4 << 20, kSlabLargest = 64 << 10, kSlabAlign = 256;
 static uint64_t currentSerial();
 extern "C" {
@@ -80,7 +83,7 @@ int PGMeshReleaseOn(void);
 Buffer::~Buffer() {
 	if (meshPages) PGMeshForget(meshPage, meshPages, 1);
 	if (!shadow.empty()) { gBufferStats.cbCount--; gBufferStats.cbBytes -= (int64_t)shadow.size(); if (version) gBufferStats.cbWritten--; }
-	if (slab >= 0) gSlabPending.push_back({currentSerial(), slab, (uint32_t)base, (bytes + kSlabAlign - 1) & ~(kSlabAlign - 1)});
+	if (slab >= 0) gSlabAllocator.release(currentSerial(), (size_t)slab, (uint32_t)base, (bytes + kSlabAlign - 1) & ~(kSlabAlign - 1));
 	if (!counted) return;
 	gBufferStats.count--; gBufferStats.bytes -= (int64_t)counted; if (slab < 0) gBufferStats.pages -= (int64_t)pageRound(counted);
 	if (bind & (1 | 2)) { gBufferStats.meshCount--; gBufferStats.meshBytes -= (int64_t)counted; }
@@ -397,37 +400,49 @@ static void waitSerial(uint64_t s) {
 }
 static inline bool inFlight(uint64_t lastUse) { return lastUse > R->completion.completed(); }
 static uint64_t currentSerial() { return R->serial; }
-static void slabRelease(int32_t slab, uint32_t off, uint32_t len) {
-	auto &free = gSlabs[slab].free;
-	auto next = free.lower_bound(off);
-	if (next != free.end() && off + len == next->first) { len += next->second; next = free.erase(next); }
-	if (next != free.begin()) {
-		auto prev = std::prev(next);
-		if (prev->first + prev->second == off) { prev->second += len; return; }
+static size_t slabReclaim(bool pressure = false, bool trimBacking = true) {
+	const auto retired = gSlabAllocator.reclaim(R->completion.completed(), pressure, trimBacking);
+	size_t released = 0;
+	for (size_t index : retired) {
+		if (index < gSlabs.size() && gSlabs[index].buf) {
+			gSlabs[index].buf = nil;
+			gBufferStats.pages -= kSlabBytes;
+			released++;
+		}
 	}
-	free[off] = len;
+	return released;
 }
-static void slabReclaim() {
-	if (gSlabPending.empty()) return;
-	size_t keep = 0;
-	for (auto &f : gSlabPending) { if (inFlight(f.serial)) gSlabPending[keep++] = f; else slabRelease(f.slab, f.off, f.len); }
-	gSlabPending.resize(keep);
+static id<MTLBuffer> newMeshSlabBacking() {
+	id<MTLBuffer> backing = [R->device newBufferWithLength:kSlabBytes options:MTLResourceStorageModeShared];
+	if (!backing && slabReclaim(true))
+		backing = [R->device newBufferWithLength:kSlabBytes options:MTLResourceStorageModeShared];
+	return backing;
 }
 static bool slabAllocate(uint32_t bytes, int32_t &slab, uint32_t &off) {
 	uint32_t len = (bytes + kSlabAlign - 1) & ~(kSlabAlign - 1);
-	slabReclaim();
-	for (size_t i = 0; i < gSlabs.size(); i++)
-		for (auto it = gSlabs[i].free.begin(); it != gSlabs[i].free.end(); ++it) if (it->second >= len) {
-			off = it->first; uint32_t rest = it->second - len;
-			gSlabs[i].free.erase(it);
-			if (rest) gSlabs[i].free[off + len] = rest;
-			slab = (int32_t)i; return true;
+	slabReclaim(false, false);
+	MeshSlabAllocator::Range range;
+	if (gSlabAllocator.allocate(len, R->completion.completed(), range)) {
+		if (range.needsBacking) {
+			id<MTLBuffer> buffer = newMeshSlabBacking();
+			if (!buffer) { gSlabAllocator.cancelNewBacking(range.slab); return false; }
+			gSlabs[range.slab].buf = buffer;
+			gBufferStats.pages += kSlabBytes;
 		}
-	id<MTLBuffer> buf = [R->device newBufferWithLength:kSlabBytes options:MTLResourceStorageModeShared];
+		slab = (int32_t)range.slab; off = range.offset; return true;
+	}
+	id<MTLBuffer> buf = newMeshSlabBacking();
 	if (!buf) return false;
-	gSlabs.push_back({buf, {{len, kSlabBytes - len}}});
+	const size_t index = gSlabAllocator.addSlot();
+	gSlabs.push_back({buf});
+	MeshSlabAllocator::Range allocated;
+	if (!gSlabAllocator.allocate(len, R->completion.completed(), allocated)) {
+		gSlabAllocator.cancelNewBacking(index); gSlabs[index].buf = nil; return false;
+	}
 	gBufferStats.pages += kSlabBytes;
-	slab = (int32_t)gSlabs.size() - 1; off = 0;
+	// An allocation-failure reclaim may have made an earlier slot available.
+	// Keep the new backing as warm capacity and return the range actually chosen.
+	slab = (int32_t)allocated.slab; off = allocated.offset;
 	return true;
 }
 
@@ -593,6 +608,12 @@ static void createTexture(const uint32_t *p) {
 		desc.swizzle = MTLTextureSwizzleChannelsMake(MTLTextureSwizzleZero, MTLTextureSwizzleZero, MTLTextureSwizzleZero, MTLTextureSwizzleRed);
 	else if (m.a8) { t->alphaView = true; desc.usage |= MTLTextureUsagePixelFormatView; }
 	t->tex = [R->device newTextureWithDescriptor:desc];
+	// Retry only when cleanup actually released completed, wholly unused backing.
+	// Keep the same descriptor and upload protocol; active textures stay intact.
+	if (!t->tex && slabReclaim(true)) {
+		t->tex = [R->device newTextureWithDescriptor:desc];
+		if (t->tex) gTextureReclaimsRecovered++;
+	}
 #if MR_TRACE
 	if (m.a8 && (bind & (BIND_RT | BIND_UAV))) logOnce("a8rt" + std::to_string(w) + "x" + std::to_string(h), "Metal renderer [trace]: A8 render target %u %ux%u bind %#x", id, w, h, bind);
 #endif
@@ -888,7 +909,7 @@ static void uploadBuffer(const uint32_t *p, bool noOverwrite) {
 		id<MTLBuffer> fresh = [R->device newBufferWithLength:b->bytes options:MTLResourceStorageModeShared];
 		if (offset || size < b->bytes) memcpy(fresh.contents, (const uint8_t *)b->buf.contents + b->base, b->bytes);
 		if (b->slab >= 0) {		// a slab buffer rewritten while in use moves to its own storage
-			gSlabPending.push_back({R->serial, b->slab, (uint32_t)b->base, (b->bytes + kSlabAlign - 1) & ~(kSlabAlign - 1)});
+			gSlabAllocator.release(R->serial, (size_t)b->slab, (uint32_t)b->base, (b->bytes + kSlabAlign - 1) & ~(kSlabAlign - 1));
 			gBufferStats.pages += (int64_t)pageRound(b->bytes);
 			b->slab = -1; b->base = 0;
 		}
@@ -2286,7 +2307,10 @@ static void present(uint32_t texId) {
 	double w0 = nowMs();
 	if (next.lastSerial) waitSerial(next.lastSerial);
 	R->work.gpuWait += nowMs() - w0;
+	// Memory warnings are handled here, after normal slot completion has
+	// advanced the serial prefix. This never introduces an extra GPU wait.
 	double retireStart = nowMs();
+	slabReclaim(gMemoryPressure.exchange(false));
 	resetCompletedFrameRing(next);
 	R->work.retire += nowMs() - retireStart;
 	double tn = nowMs();
@@ -2576,9 +2600,13 @@ static void report() {
 	uint64_t ring = 0, ringBig = 0;
 	for (auto &f : R->frames) { ring += f.chunks.size() * FrameRing::CHUNK; for (id<MTLBuffer> b : f.big) ringBig += b.length; }
 	logf("[metal] constant buffers: %lld (%.0f MB on the CPU), %lld ever written", (long long)gBufferStats.cbCount.load(), gBufferStats.cbBytes / MB, (long long)gBufferStats.cbWritten.load());
+	const auto slabs = gSlabAllocator.stats();
 	logf("[metal] buffers: %lld (%.0f MB, %.0f MB in whole pages), meshes %lld (%.0f MB), %zu slabs; frame ring %.0f MB + %.0f MB large",
 	     (long long)gBufferStats.count.load(), gBufferStats.bytes / MB, gBufferStats.pages / MB, (long long)gBufferStats.meshCount.load(),
-	     gBufferStats.meshBytes / MB, gSlabs.size(), ring / MB, ringBig / MB);
+	     gBufferStats.meshBytes / MB, slabs.retainedSlabs, ring / MB, ringBig / MB);
+	logf("[metal] mesh slab memory: %zu active, %.0f MB in live/pending ranges; %.0f MB retained, %.0f MB empty, %.0f MB released total; texture allocation recoveries %llu",
+	     slabs.activeSlabs, slabs.liveBytes / MB, slabs.retainedBytes / MB, slabs.emptyBytes / MB,
+	     slabs.releasedBytes / MB, (unsigned long long)gTextureReclaimsRecovered);
 	if (gSkipTopMip || gSkipBigTopMip) logf("[metal] %s: %lld textures without their largest level; %llu copies or readbacks needed one", gSkipTopMip ? "Lite" : "Big textures", (long long)gTextureStats.halfSize.load(), (unsigned long long)gTextureStats.missingLevel.load());
 	memset(R->commitReasons, 0, sizeof R->commitReasons); memset(R->skipReasons, 0, sizeof R->skipReasons);
 	R->statT = now; R->statDraws = R->draws; R->statPresents = R->presents; R->statSkips = R->skipped; R->statPending = R->pendingSkips; R->statCommits = R->commits; R->busyMs = 0;
@@ -2658,6 +2686,9 @@ fragment D pg_depth_copy(V in [[stage_in]], texture2d<float> t [[texture(0)]]) {
 static bool setup() {
 	R->device = R->layer.device ?: MTLCreateSystemDefaultDevice();
 	if (!R->device) return false;
+	[NSNotificationCenter.defaultCenter addObserverForName:UIApplicationDidReceiveMemoryWarningNotification object:nil queue:nil usingBlock:^(NSNotification *) {
+		gMemoryPressure.store(true);
+	}];
 	R->layer.device = R->device;
 	R->layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
 	R->layer.framebufferOnly = YES;
