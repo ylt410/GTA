@@ -56,6 +56,20 @@ jobs:
       - name: Compare synchronization work and validate demanded Metal depth copies
         run: /usr/bin/python3 app/Scripts/check_a17_efficiency.py --report A17-Efficiency-Validation.json
 
+      - name: Fetch the pinned audio source before generating the engine
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          archive="$RUNNER_TEMP/opus-1.5.2.tar.gz"
+          for attempt in 1 2 3; do
+            if gh release download build-dependencies --repo "${{ github.repository }}" --pattern opus-1.5.2.tar.gz --output "$archive" --clobber; then
+              break
+            fi
+          done
+          echo "65c1d2f78b9f2fb20082c38cbe47c951ad5839345876e46941612ee87f9a7ce1  $archive" | shasum -a 256 -c -
+          mkdir -p app/Tools
+          cp "$archive" app/Tools/opus-1.5.2.tar.gz
+
       - name: Reuse verified engine shaders from the previous verified device build
         env:
           GH_TOKEN: ${{ github.token }}
