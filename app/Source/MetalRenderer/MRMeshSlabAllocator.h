@@ -28,6 +28,8 @@ private:
     std::vector<Pending> pending_;
     std::uint32_t slabBytes_, warmFloor_;
     std::uint64_t emptyAge_, releasedBytes_ = 0;
+    std::uint64_t earliestPendingSerial_ = 0;
+    bool hasPendingSerial_ = false;
 
     static void insertFree(Slot &slot, std::uint32_t offset, std::uint32_t length) {
         auto next = slot.free.lower_bound(offset);
@@ -94,20 +96,40 @@ public:
         return false;
     }
     void release(std::uint64_t serial, std::size_t slab, std::uint32_t offset, std::uint32_t length) {
-        if (slab < slots_.size() && slots_[slab].backed) pending_.push_back({serial, slab, offset, length});
+        if (slab < slots_.size() && slots_[slab].backed) {
+            pending_.push_back({serial, slab, offset, length});
+            if (!hasPendingSerial_ || serial < earliestPendingSerial_) {
+                earliestPendingSerial_ = serial;
+                hasPendingSerial_ = true;
+            }
+        }
     }
     // Must be called with the renderer's contiguous completed-serial prefix.
     // Pressure bypasses age and retains one warm slot; ordinary trimming keeps
     // the configured floor and a full idle window to avoid allocation churn.
     std::vector<std::size_t> reclaim(std::uint64_t completedSerial, bool pressure = false, bool trimBacking = true) {
-        std::size_t keep = 0;
-        for (const Pending &p : pending_) {
-            if (p.serial > completedSerial) { pending_[keep++] = p; continue; }
-            Slot &slot = slots_[p.slab];
-            insertFree(slot, p.offset, p.length);
-            if (empty(slot)) slot.emptySince = completedSerial;
+        // Allocation calls run this for each mesh buffer. If no pending range
+        // can have completed, avoid rescanning the whole retirement queue.
+        if (!hasPendingSerial_ || earliestPendingSerial_ > completedSerial) {
+            if (!trimBacking) return {};
+        } else {
+            std::size_t keep = 0;
+            hasPendingSerial_ = false;
+            for (const Pending &p : pending_) {
+                if (p.serial > completedSerial) {
+                    if (!hasPendingSerial_ || p.serial < earliestPendingSerial_) {
+                        earliestPendingSerial_ = p.serial;
+                        hasPendingSerial_ = true;
+                    }
+                    pending_[keep++] = p;
+                    continue;
+                }
+                Slot &slot = slots_[p.slab];
+                insertFree(slot, p.offset, p.length);
+                if (empty(slot)) slot.emptySince = completedSerial;
+            }
+            pending_.resize(keep);
         }
-        pending_.resize(keep);
         // Allocation calls only collect newly completed ranges. Empty-backing
         // scans and trimming run at frame retirement, not for each mesh buffer.
         if (!trimBacking) return {};

@@ -37,6 +37,11 @@ def main():
         ('renderer_completion_owners', cxx, 'c++17', 'Tests/renderer_completion_owners.cpp'),
         ('mesh_slab_allocator', cxx, 'c++17', 'Tests/metal_mesh_slab_allocator.cpp'),
         ('depth_proxy_range', cxx, 'c++17', 'Tests/metal_depth_proxy_range.cpp'),
+        ('archive_lookup', cc, 'c11', 'Tests/archive_lookup.c'),
+        ('http_range', cc, 'c11', 'Tests/http_range.c'),
+        ('copy_on_write_bytes', cxx, 'c++17', 'Tests/copy_on_write_bytes.cpp'),
+        ('mesh_slab_reclaim', cxx, 'c++17', 'Tests/mesh_slab_reclaim.cpp'),
+        ('mesh_slab_equivalence', cxx, 'c++17', 'Tests/mesh_slab_equivalence.cpp'),
     ]
     with tempfile.TemporaryDirectory(prefix='fanport-preflight-') as work:
         for name, compiler, standard, source in tests:
@@ -46,6 +51,10 @@ def main():
                  '-pthread', '-I', 'Source', source, '-o', target])
             run([target])
         run([shutil.which('python3') or 'python3', 'Tests/precompiled_shaders.py'])
+        # Exercise the actual production CPU paths without requiring a Metal
+        # device; SDK compilation still runs below in the macOS build job.
+        run([shutil.which('python3') or 'python3', 'Tests/archive_production.py'])
+        run([shutil.which('python3') or 'python3', 'Tests/compressed_shadow_production.py'])
         futex = Path(work) / 'futex-waits'
         feature = '-D_DARWIN_C_SOURCE' if platform.system() == 'Darwin' else '-D_GNU_SOURCE'
         run([cc, '-std=c11', feature, '-O2', '-Wall', '-Wextra', '-Werror', '-pthread', '-DPG_FUTEX_TESTING',

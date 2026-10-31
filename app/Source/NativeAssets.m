@@ -14,6 +14,7 @@
 #include "NativeOIV.h"
 #include "NativeLocalAssetReader.h"
 #include "NativeAssetRangeSearch.h"
+#include "NativeHTTPRange.h"
 
 // A language choice requested by the native app when the WASM engine boots.
 // This does not guarantee the underlying web game uses the locale or has the necessary fonts.
@@ -552,27 +553,44 @@ void pg_assets_configure(const char *manifest,const char *root) {
   }
 }
 static NSData *fetchRangeImpl(NSString *path,uint64_t offset,uint64_t length,uint64_t *actualSize) {
+  // Both callers pass the immutable manifest size through actualSize. Reject
+  // invalid intervals before computing the inclusive end or issuing a request.
+  if(!actualSize)return nil;
+  uint64_t expectedSize=*actualSize;
+  if(!length)return offset<=expectedSize?[NSData data]:nil;
+  if(!pg_http_range_request_valid(offset,length,expectedSize))return nil;
   NSString *escaped=[path stringByAddingPercentEncodingWithAllowedCharacters:[NSCharacterSet URLPathAllowedCharacterSet]];
   NSURL *url=[NSURL URLWithString:[[assetServer stringByAppendingString:@"/data/"] stringByAppendingString:escaped]];
   NSMutableURLRequest *request=[NSMutableURLRequest requestWithURL:url];
   [request setValue:[NSString stringWithFormat:@"bytes=%llu-%llu",offset,offset+length-1] forHTTPHeaderField:@"Range"];
   dispatch_semaphore_t done=dispatch_semaphore_create(0);
-  __block NSData *received=nil;__block NSHTTPURLResponse *reply=nil;__block NSError *failure=nil;
-  NSURLSessionDataTask *task=[assetSession dataTaskWithRequest:request completionHandler:^(NSData *data,NSURLResponse *response,NSError *error){received=data;reply=(NSHTTPURLResponse *)response;failure=error;dispatch_semaphore_signal(done);}];
+  __block NSData *received=nil;__block NSURLResponse *response=nil;__block NSError *failure=nil;
+  NSURLSessionDataTask *task=[assetSession dataTaskWithRequest:request completionHandler:^(NSData *data,NSURLResponse *reply,NSError *error){received=data;response=reply;failure=error;dispatch_semaphore_signal(done);}];
   task.priority=assetSpeculativeRead?NSURLSessionTaskPriorityLow:assetPrefetchRead?NSURLSessionTaskPriorityDefault:NSURLSessionTaskPriorityHigh;
   if(assetSimulatedLatencyMS)usleep(assetSimulatedLatencyMS*1000);
   [task resume];dispatch_semaphore_wait(done,DISPATCH_TIME_FOREVER);
   if(failure){pg_log(failure.localizedDescription.UTF8String);return nil;}
+  if(![response isKindOfClass:NSHTTPURLResponse.class]){pg_log("Asset range response was not HTTP.");return nil;}
+  NSHTTPURLResponse *reply=(NSHTTPURLResponse *)response;
   NSString *range=[reply valueForHTTPHeaderField:@"Content-Range"];
-  NSString *total=[[range componentsSeparatedByString:@"/"] lastObject];
-  if(total.length&&![total isEqualToString:@"*"])*actualSize=strtoull(total.UTF8String,NULL,10);
-  if(reply.statusCode==416)return [NSData data];
-  if(reply.statusCode!=206){NSString *message=[NSString stringWithFormat:@"Asset range HTTP %ld, URL %@, server %@",(long)reply.statusCode,reply.URL,[reply valueForHTTPHeaderField:@"Server"]];pg_log(message.UTF8String);return nil;}
-  uint64_t sum=atomic_fetch_add(&fetchedBytes,received.length)+received.length;
-  assetReadNetworkBytes+=received.length;assetReadSource=3;
-  uint64_t report=atomic_load(&nextReport);
-  if(sum>=report&&atomic_compare_exchange_strong(&nextReport,&report,report+25*1024*1024)){
-    char line[128];snprintf(line,sizeof line,"Native asset cache: %.1f MB downloaded.",sum/1048576.0);pg_log(line);
+  bool validRange=pg_http_range_validate_response((int)reply.statusCode,range.UTF8String,
+                                                 offset,length,expectedSize,
+                                                 (uint64_t)received.length,actualSize);
+  if(*actualSize!=expectedSize)assetSizeMismatch=true;
+  // Keep download counters' historical meaning: bytes received with an HTTP
+  // 206 count as network traffic even when validation below rejects them.
+  if(reply.statusCode==206){
+    uint64_t sum=atomic_fetch_add(&fetchedBytes,received.length)+received.length;
+    assetReadNetworkBytes+=received.length;assetReadSource=3;
+    uint64_t report=atomic_load(&nextReport);
+    if(sum>=report&&atomic_compare_exchange_strong(&nextReport,&report,report+25*1024*1024)){
+      char line[128];snprintf(line,sizeof line,"Native asset cache: %.1f MB downloaded.",sum/1048576.0);pg_log(line);
+    }
+  }
+  if(!validRange){
+    if(reply.statusCode!=206){NSString *message=[NSString stringWithFormat:@"Asset range HTTP %ld, URL %@, server %@",(long)reply.statusCode,reply.URL,[reply valueForHTTPHeaderField:@"Server"]];pg_log(message.UTF8String);}
+    else pg_log("Asset range response did not match the requested manifest range.");
+    return nil;
   }
   return received;
 }

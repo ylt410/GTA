@@ -23,7 +23,11 @@ APP = 'Payload/PlayGTA5Native.app/'
 ABI_FILES = {
     'ShaderTool/pgmsl.cc': '76e68792034995f595f835da6d456d13f51d45a9c88bdc0e08474d18349c4690',
     'Scripts/build_metal_shaders.py': 'b820e2cb73e631735d3083b69142d91dab4792f92a78d698cc2b7ce208e626af',
-    'Source/MetalRenderer/MRInternal.h': '49660fb666cd08df10a8197adc22608b20b408d3791977d570cd61bbe065a36d',
+    # Reviewed CPU-only delta: Texture::compressedShadow now shares payloads.
+    # Argument slots, shader reflection and GPU-visible layouts are unchanged;
+    # Tests/precompiled_shaders.py reconstructs and hashes the original header.
+    # Keep an exact fingerprint, not a blanket exclusion of this header.
+    'Source/MetalRenderer/MRInternal.h': 'cb3c04a40365d1201e170889973316cd79cc406b7524df5613cfc5332d70f4cb',
     'Source/MetalRenderer/MRShaders.mm': '31c9c8663418c7dc42beb96f43db71006e3037d311a19b29007815b0cd5021bc',
 }
 RESOURCES = {

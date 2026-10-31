@@ -678,10 +678,12 @@ static void storeCompressed(Texture *t, uint32_t mip, uint32_t slice, uint32_t x
 		uint64_t key = ((uint64_t)mip << 32) | (three ? z + layer : slice + layer);
 		auto &shadow = t->compressedShadow[key];
 		if (shadow.empty()) { shadow.resize((size_t)pitch * rows); gTextureStats.shadowBytes += (int64_t)shadow.size(); }
+		uint8_t *destination = nullptr;
 		for (uint32_t row = 0; row < uploadRows; row++) {
 			size_t from = layer * sourceSlice + (size_t)row * bpr, to = (size_t)(y / 4 + row) * pitch + (x / 4) * bb;
 			if (from + count > size || to + count > shadow.size()) break;
-			memcpy(shadow.data() + to, data + from, count);
+			if (!destination) destination = shadow.mutableData();
+			memcpy(destination + to, data + from, count);
 		}
 	}
 }
@@ -1957,12 +1959,17 @@ static void copyRegion(const uint32_t *p) {
 		for (uint32_t zz = 0; zz < (s->dim == 3 ? dep : 1); zz++) {
 			auto src = s->compressedShadow.find(((uint64_t)sMip << 32) | (s->dim == 3 ? sz + zz : sLayer));
 			if (src == s->compressedShadow.end()) continue;
+			// Retain the source before map insertion or destination detachment.
+			// This also gives a stable snapshot for same-texture region copies.
+			const CopyOnWriteBytes source = src->second;
 			auto &dst = d->compressedShadow[((uint64_t)dMip << 32) | (d->dim == 3 ? dz + zz : dLayer)];
 			if (dst.empty()) { dst.resize((size_t)dp * ((dh + 3) / 4)); gTextureStats.shadowBytes += (int64_t)dst.size(); }
+			uint8_t *destination = nullptr;
 			for (uint32_t row = 0; row < rows; row++) {
 				size_t from = (size_t)(sy / 4 + row) * sp + (sx / 4) * bb, to = (size_t)(dy / 4 + row) * dp + (dx / 4) * bb;
-				if (from + bytes > src->second.size() || to + bytes > dst.size()) break;
-				memcpy(dst.data() + to, src->second.data() + from, bytes);
+				if (from + bytes > source.size() || to + bytes > dst.size()) break;
+				if (!destination) destination = dst.mutableData();
+				memcpy(destination + to, source.data() + from, bytes);
 			}
 		}
 	}
@@ -2673,10 +2680,14 @@ static void report() {
 	R->serialWaitCalls = R->snapshotOwnersVisited = R->snapshotOwnersReleased = 0;
 	R->longFrames = 0; R->worstFrameMs = 0;
 	const double MB = 1048576.0;
-	logf("[metal] textures: GPU %.0f MB (BC: game counts %.0f MB, GPU holds %.0f MB), CPU block copies %.0f MB; BC readbacks %llu, BC copies %llu; create failures %llu, decode failures %llu",
+	logf("[metal] textures: GPU %.0f MB (BC: game counts %.0f MB, GPU holds %.0f MB), logical CPU blocks %.0f MB; BC readbacks %llu, BC copies %llu; create failures %llu, decode failures %llu",
 	     gTextureStats.gpuBytes / MB, gTextureStats.bcGameBytes / MB, gTextureStats.bcGpuBytes / MB, gTextureStats.shadowBytes / MB,
 	     (unsigned long long)gTextureStats.bcReadbacks.load(), (unsigned long long)gTextureStats.bcCopies.load(),
 	     (unsigned long long)gTextureStats.createFailures.load(), (unsigned long long)gTextureStats.decodeFailures.load());
+	const auto shadowStats = CopyOnWriteBytes::statistics();
+	logf("[metal] CPU block payloads: live %.2f MB, accounted peak %.2f MB; since launch: cloned %.2f MB, %llu payload owners created (excludes metadata/RSS/reallocation transients)",
+	     shadowStats.livePayloadCapacityBytes / MB, shadowStats.peakAccountedLivePayloadCapacityBytes / MB,
+	     shadowStats.cloneBytes / MB, (unsigned long long)shadowStats.payloadAllocations);
 	logf("[metal] depth proxies since launch: %llu refreshes, %llu subresources / %.0f M texels copied; full-copy reference %.0f M texels",
 	     (unsigned long long)R->depthProxyRequests, (unsigned long long)R->depthProxySubresourceCopies,
 	     R->depthProxyTexels / 1000000.0, R->depthProxyFullReferenceTexels / 1000000.0);

@@ -14,6 +14,7 @@
 #include <memory>
 #include <atomic>
 #include <map>
+#include "MRCopyOnWriteBytes.h"
 
 extern "C" void pg_log(const char *);
 extern "C" uint32_t PGGraphicsNotify(uint64_t);
@@ -87,7 +88,7 @@ struct Texture : Object {
 	uint64_t lastUse = 0;		// command buffer serial that last referenced it
 	std::unordered_map<uint64_t, id<MTLTexture>> views;
 	uint64_t gpuBytes = 0, bcGameBytes = 0;		// GPU allocation, and the compressed size the game budgets (for the report)
-	std::unordered_map<uint64_t, std::vector<uint8_t>> compressedShadow;		// "mip:layer" -> original blocks, for CPU readbacks
+	std::unordered_map<uint64_t, CopyOnWriteBytes> compressedShadow;		// "mip:layer" -> original blocks; copies share until written
 	Texture *depthProxy = nullptr;		// r32float copy of a depth texture, for shaders that read it as float (if needed)
 	bool proxyDirty = true;
 	~Texture() override;

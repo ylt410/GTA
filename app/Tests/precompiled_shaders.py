@@ -107,4 +107,35 @@ class PrecompiledShaders(unittest.TestCase):
     def test_changed_shader_abi_rejected(self):
         with self.assertRaisesRegex(ValueError, 'shader ABI'): restore.check_abi(self.root)
 
+    def test_shadow_storage_delta_is_cpu_only(self):
+        # Undo exactly the two reviewed host-storage edits. The entire result
+        # must match the shader-cache baseline header, not just selected fields.
+        header = (restore.ROOT / 'Source/MetalRenderer/MRInternal.h').read_text()
+        include = '#include "MRCopyOnWriteBytes.h"\n'
+        current = '\tstd::unordered_map<uint64_t, CopyOnWriteBytes> compressedShadow;\t\t// "mip:layer" -> original blocks; copies share until written\n'
+        original = '\tstd::unordered_map<uint64_t, std::vector<uint8_t>> compressedShadow;\t\t// "mip:layer" -> original blocks, for CPU readbacks\n'
+        self.assertEqual(header.count(include), 1)
+        self.assertEqual(header.count(current), 1)
+        restored = header.replace(include, '').replace(current, original)
+        self.assertEqual(digest(restored.encode()),
+                         '49660fb666cd08df10a8197adc22608b20b408d3791977d570cd61bbe065a36d')
+
+    def test_each_abi_file_remains_pinned(self):
+        fixtures = {}
+        for name in restore.ABI_FILES:
+            path = self.root / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            data = ('fixture:' + name).encode()
+            path.write_bytes(data)
+            fixtures[name] = digest(data)
+        with mock.patch.object(restore, 'ABI_FILES', fixtures):
+            restore.check_abi(self.root)
+            for name in fixtures:
+                path = self.root / name
+                original = path.read_bytes()
+                path.write_bytes(original + b' changed')
+                with self.assertRaisesRegex(ValueError, 'shader ABI'):
+                    restore.check_abi(self.root)
+                path.write_bytes(original)
+
 if __name__ == '__main__': unittest.main()
