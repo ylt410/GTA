@@ -48,7 +48,7 @@ struct Result {
 };
 struct Slot { id<MTLBuffer> buffer = nil; bool busy = false; };
 struct Session {
-    uint64_t id = 0;
+    uint64_t sessionId = 0;
     bool enabled = false, active = true, pipelineFailed = false;
     uint32_t sourceFrames = 0, candidates = 0, cameraVerifiedFrames = 0, boundaryFrames = 0;
     uint32_t scheduled = 0, completed = 0, gpuFailures = 0, busySkips = 0;
@@ -139,7 +139,7 @@ NSDictionary *resultJSON(const Result &r) {
 
 void PGTDProbeBegin(uint64_t session, bool enabled) {
     auto s = std::make_shared<Session>();
-    s->id = session; s->enabled = enabled; s->results.reserve(kMaximumDispatches);
+    s->sessionId = session; s->enabled = enabled; s->results.reserve(kMaximumDispatches);
     {
         std::lock_guard<std::mutex> lock(mutex);
         current = s;
@@ -151,7 +151,7 @@ void PGTDProbeBegin(uint64_t session, bool enabled) {
 }
 void PGTDProbeEnd(uint64_t session) {
     std::lock_guard<std::mutex> lock(mutex);
-    if (current && current->id == session) {
+    if (current && current->sessionId == session) {
         current->active = false;
         requested.store(false, std::memory_order_release);
     }
@@ -169,7 +169,7 @@ void PGTDProbeObserveSample(const PGTDMetalSample &sample, const PGTDProbeDrawSt
     if (!PGTDProbeRequested()) return;
     std::lock_guard<std::mutex> lock(mutex);
     auto s = current;
-    if (!s || !s->active || s->id != sample.tag.session) return;
+    if (!s || !s->active || s->sessionId != sample.tag.session) return;
     Frame &f = s->frame;
     if (sample.opcode == 26 && sample.tag.stage == 103) f.sceneTarget = sample.colorToken[0];
     if (sample.opcode == 26 && sample.tag.stage == 105 && f.boundary && !f.uiTarget) {
@@ -213,14 +213,14 @@ void PGTDProbeObserveSample(const PGTDMetalSample &sample, const PGTDProbeDrawSt
 bool PGTDProbeNeedsBoundary(const PGTDTag &tag, uint32_t opcode) {
     if (!PGTDProbeRequested() || opcode != 26 || tag.stage != 105) return false;
     std::lock_guard<std::mutex> lock(mutex);
-    return current && current->active && current->id == tag.session && !current->frame.boundary;
+    return current && current->active && current->sessionId == tag.session && !current->frame.boundary;
 }
 
 void PGTDProbeEncodeBoundary(id<MTLCommandBuffer> commandBuffer, const PGTDTag &tag) {
     if (!PGTDProbeRequested()) return;
     std::unique_lock<std::mutex> lock(mutex);
     auto s = current;
-    if (!s || !s->active || s->id != tag.session || s->frame.boundary) return;
+    if (!s || !s->active || s->sessionId != tag.session || s->frame.boundary) return;
     Frame &f = s->frame;
     f.boundary = true; ++s->boundaryFrames;
     const uint32_t frame = s->sourceFrames + 1;
@@ -342,7 +342,7 @@ void PGTDProbeSourcePresent(void) {
 NSDictionary *PGTDProbeCopySummary(uint64_t session) {
     std::unique_lock<std::mutex> lock(mutex);
     auto s = current;
-    if (!s || s->id != session) { s = std::make_shared<Session>(); s->id = session; s->active = false; }
+    if (!s || s->sessionId != session) { s = std::make_shared<Session>(); s->sessionId = session; s->active = false; }
     completion.wait_for(lock, std::chrono::seconds(2), [&] { return s->pending == 0; });
     NSMutableArray *frames = [NSMutableArray arrayWithCapacity:s->results.size()];
     for (const auto &r : s->results) {
@@ -353,7 +353,7 @@ NSDictionary *PGTDProbeCopySummary(uint64_t session) {
     NSMutableDictionary *rejections = [NSMutableDictionary dictionary];
     for (const auto &entry : s->rejections) rejections[[NSString stringWithUTF8String:entry.first.c_str()]] = @(entry.second);
     return @{@"requested": @(s->enabled), @"mode": s->enabled ? @"camera-only-depth-probe" : @"off",
-        @"session": [NSString stringWithFormat:@"%016llx", (unsigned long long)s->id],
+        @"session": [NSString stringWithFormat:@"%016llx", (unsigned long long)s->sessionId],
         @"grid": @[@(kGridWidth), @(kGridHeight)], @"maximumDispatches": @(kMaximumDispatches),
         @"sourceFrames": @(s->sourceFrames), @"candidates": @(s->candidates),
         @"cameraVerifiedFrames": @(s->cameraVerifiedFrames), @"boundaryFrames": @(s->boundaryFrames),
