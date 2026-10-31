@@ -51,9 +51,14 @@ uint64_t PGTDScopeEnter(uint32_t kind, uint64_t identity, uint64_t auxiliary,
 }
 void PGTDScopeLeave(uint64_t cookie) { (void)cookie; }
 
+// Apple SDKs may provide a fortified memcpy macro. Replace it only for the
+// bridge under test, then restore the SDK definition for the remaining test.
+#pragma push_macro("memcpy")
+#undef memcpy
 #define memcpy pgtd_test_memcpy
 #include "../Source/NativeTemporalEngine.inc"
 #undef memcpy
+#pragma pop_macro("memcpy")
 
 static void put(uint8_t *data, uint64_t offset, const void *value, size_t size) {
   memcpy(data + offset, value, size);
