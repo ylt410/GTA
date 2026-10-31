@@ -54,6 +54,7 @@ uint64_t PGProcessAvailableMemory(void) {
 }
 
 static struct w2c_env env;
+#include "NativeTemporalEngine.inc"
 static struct w2c_wasi__snapshot__preview1 wasi = { .env = &env };
 static PGLogCallback logCallback;
 static void *logContext;
@@ -162,6 +163,7 @@ void w2c_env_0x5Femscripten_throw_longjmp(struct w2c_env *host) {
   if (!frame) pg_missing_import("env._emscripten_throw_longjmp");
   static _Atomic int logged;
   if (atomic_fetch_add(&logged, 1) < 20) pg_log("The engine handled an error with longjmp; the game continues.");
+  PGTDInvalidateThread(); // Native unwinding bypasses generated-C scope exits.
   _longjmp(frame->jump, 1);
 }
 // Where fiDeviceMemory::Create finds the address in "memory:$0x...,size,flags:name"
@@ -3315,6 +3317,7 @@ void pg_drop_destroyed_phases(w2c_game *instance) {
 }
 void pg_note_call_indirect(const char *function,uint32_t index,uint32_t size){indirectFunction=function;indirectIndex=index;indirectSize=size;}
 void pg_record_trap(int code) {
+  PGTDInvalidateThread();
   pg_invoke_top=NULL; // the trap leaves every invoke_* on this thread, so their jump points are gone
   void *frames[20];int count=backtrace(frames,20);char line[160];
   snprintf(line,sizeof line,"Native trap %d; app image base %p",code,_dyld_get_image_header(0));pg_log(line);

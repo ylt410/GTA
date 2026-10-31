@@ -24,6 +24,7 @@
 #include "BCTextureDecoder.h"
 #include "BC1ToASTC.h"
 #include "NativeGraphics.h"
+#include "NativeTemporalDiagnosticsPlatform.h"
 #include "NativeFrameRate.h"
 #import <UIKit/UIKit.h>
 #if __has_include(<MetalFX/MetalFX.h>) && !TARGET_OS_SIMULATOR		// iPhone SDK only
@@ -1689,7 +1690,10 @@ static inline void traceDraw(const uint32_t *, Shader *, Shader *, Layout *, con
 static void capture(Texture *t, const std::string &name, id<MTLRenderPipelineState> pipe = nil, id<MTLTexture> second = nil);
 static void drawInner(const uint32_t *p);
 static const char *drawOutcome;
+static Shader *diagnosticDrawVS, *diagnosticDrawPS;
+static bool diagnosticShaderSwap;
 static void draw(const uint32_t *p) {
+	if (PGTDEnabled()) { diagnosticDrawVS = diagnosticDrawPS = nullptr; diagnosticShaderSwap = false; }
 	drawOutcome = "ok";
 	drawInner(p);
 #if MR_TRACE
@@ -1772,6 +1776,7 @@ static void drawInner(const uint32_t *p) {
 	bool maskSwap = minimapMaskSwap(vs, ps);
 	if (maskSwap != R->lastMaskSwap) { R->lastMaskSwap = maskSwap; R->pipeDirty = true; }
 	if (maskSwap) drawOutcome = "ok-maskswap";
+	if (PGTDEnabled()) { diagnosticDrawVS = vs; diagnosticDrawPS = ps; diagnosticShaderSwap = maskSwap; }
 	prepareProxies(vs->info, 0);
 	if (ps) prepareProxies(ps->info, 1);
 	if (!ensurePass()) { drawOutcome = "SKIP-norT"; R->skipped++; R->skipReasons[2]++; return; }
@@ -2723,6 +2728,89 @@ static void report() {
 	for (;;) sleep(60);
 }
 
+// Diagnostic-only CPU metadata. No readback, extra GPU pass, game-memory mutation,
+// history reconstruction or screenshot. These are observed bindings, not verified
+// Temporal inputs; unknown/skipped/instanced paths remain explicitly distinguishable.
+static void temporalDiagnosticSample(const PGTDTag &tag, uint32_t op, const uint32_t *p,
+                                     uint32_t n, uint64_t drawsBefore) {
+	PGTDMetalSample s{}; s.tag = tag; s.opcode = op;
+	if (op == DRAW && n >= 6) {
+		s.drawKind = p[0]; s.indexCount = p[1]; s.instanceCount = p[2];
+		if (R->draws == drawsBefore) s.flags |= 4u; // no draw encoded, including zero-count early returns
+		if (p[2] != 1 || p[0] >= 2) s.flags |= 8u; // candidate entity is not per-instance identity
+		if (diagnosticShaderSwap) s.flags |= 64u;
+	}
+	Shader *vs = op == DRAW ? diagnosticDrawVS : R->objs.as<Shader>(R->shader[0], OShader);
+	Shader *ps = op == DRAW ? diagnosticDrawPS : R->objs.as<Shader>(R->shader[1], OShader);
+	auto noteShader = [](Shader *shader) -> uint32_t {
+		if (!shader) return 0;
+		uint32_t token = PGTDToken(100, shader->oid);
+		PGTDPlatformShader(token, shader->hash.c_str(), shader->info ? shader->info->label.c_str() : "");
+		return token;
+	};
+	s.vsToken = noteShader(vs); s.psToken = noteShader(ps);
+	if (vs && ps) s.flags |= 1u;
+	if (R->objs.as<Layout>(R->layout, OLayout)) s.layoutToken = PGTDToken(100, R->layout);
+	for (unsigned i = 0; i < 4; ++i) {
+		Texture *t = texture(R->rt[i].tex);
+		if (!t || !t->tex) continue;
+		s.colorToken[i] = PGTDToken(100, t->oid); s.colorFormat[i] = (uint32_t)t->format;
+		s.colorWidth[i] = (uint32_t)t->tex.width; s.colorHeight[i] = (uint32_t)t->tex.height;
+		s.colorSamples[i] = t->samples;
+		if (R->rt[i].mip || R->rt[i].slice || t->skip) s.flags |= 16u; // base-size comparison is insufficient
+	}
+	if (Texture *t = texture(R->ds.tex)) {
+		s.depthToken = PGTDToken(100, t->oid); s.depthFormat = (uint32_t)t->format;
+		s.depthWidth = t->tex ? (uint32_t)t->tex.width : 0; s.depthHeight = t->tex ? (uint32_t)t->tex.height : 0;
+		s.depthSamples = t->samples; s.depthMip = R->ds.mip; s.depthSlice = R->ds.slice;
+		if (R->ds.mip || R->ds.slice || t->skip) s.flags |= 16u;
+	}
+	if (op == PRESENT && n >= 1) if (Texture *t = texture(p[0])) {
+		s.presentedToken = PGTDToken(100, t->oid); s.presentedFormat = (uint32_t)t->format;
+		s.presentedWidth = t->tex ? (uint32_t)t->tex.width : 0; s.presentedHeight = t->tex ? (uint32_t)t->tex.height : 0;
+	}
+	std::copy_n(R->viewport, 4, s.viewport);
+	if (ps && ps->info) {
+		unsigned out = 0;
+		for (const auto &b : ps->info->res) {
+			if (out == 4) break;
+			if (b.kind != RTexture && b.kind != RTextureMS && b.kind != RDepth && b.kind != RDepthMS) continue;
+			if (b.binding < 32 || b.binding >= 160) continue;
+			View *v = view(R->srv[1][b.binding - 32], OSrv);
+			Texture *t = v && !v->isBuf ? texture(v->res) : nullptr;
+			if (!t || !t->tex) continue;
+			s.srvSlot[out] = b.binding - 32; s.srvToken[out] = PGTDToken(100, t->oid);
+			s.srvFormat[out] = (uint32_t)t->format; s.srvWidth[out] = (uint32_t)t->tex.width; s.srvHeight[out] = (uint32_t)t->tex.height;
+			// These are base resource dimensions/formats, not a created Metal SRV.
+			if (v->a || v->c || v->d || (v->b && v->b != UINT32_MAX) || v->fmt || t->skip || t->alphaView) s.flags |= 32u;
+			++out;
+		}
+	}
+	static const unsigned slots[4] = {1, 2, 3, 0};
+	for (unsigned i = 0; i < 4; ++i) {
+		const auto &c = R->cb[0][slots[i]];
+		Buffer *b = buffer(c.buf);
+		const uint64_t start = (uint64_t)c.first * 16;
+		if (!b || start >= b->shadow.size()) continue;
+		s.uniformToken[i] = PGTDToken(100, b->oid); s.uniformFirst[i] = c.first;
+		// Respect the actual reflected range when known; otherwise report a capped
+		// current-buffer prefix, not an asserted complete bone palette.
+		size_t bytes = std::min<size_t>(4096, b->shadow.size() - (size_t)start);
+		if (c.num) bytes = std::min<size_t>(bytes, (size_t)c.num * 16);
+		if (vs && vs->info) for (const auto &r : vs->info->res) if (r.kind == RUbo && r.binding == slots[i]) bytes = std::min<size_t>(bytes, r.size);
+		s.uniformBytes[i] = (uint32_t)bytes;
+		uint64_t hash = 14695981039346656037ull;
+		for (size_t j = 0; j < bytes; ++j) hash = fnv(hash, b->shadow[(size_t)start + j]);
+		s.uniformHash[i] = hash;
+		if (i == 0 && bytes >= 48 * sizeof(float)) {
+			memcpy(s.wvp, b->shadow.data() + start + 32 * sizeof(float), sizeof s.wvp);
+			bool valid = true; for (float value : s.wvp) valid &= std::isfinite(value);
+			if (valid) s.flags |= 2u; else memset(s.wvp, 0, sizeof s.wvp);
+		}
+	}
+	PGTDRecordMetal(&s);
+}
+
 static void loop() {
 	auto *hdr = (std::atomic<uint32_t> *)(R->mem + R->ring);
 	uint32_t tail = RING_DATA;
@@ -2754,7 +2842,19 @@ static void loop() {
 				uint32_t op = base[0], n = base[1];
 				if (op == WRAP) { tail = RING_DATA; continue; }
 				if (n > (R->ringSize - tail - 8) / 4 || (tail < head && tail + 8 + n * 4 > head)) ringFault(op, n, tail, head);
+				PGTDTag diagnosticTag; // only populated on a matched active sample
+				const bool diagnostics = PGTDEnabled() != 0;
+				const bool sampled = diagnostics && (op == DRAW || op == PRESENT || op == SET_RENDER_TARGETS) &&
+					PGTDConsumePacket(R->ring + tail, op, n, &diagnosticTag);
+				// Object IDs may be recycled. A create/destroy breaks diagnostic identity,
+				// including replacements that did not have a separate destroy packet.
+				if (diagnostics && n && (op == DESTROY_OBJECT || op == CREATE_TEXTURE || op == CREATE_BUFFER ||
+				    op == CREATE_SHADER || op == CREATE_LAYOUT || op == CREATE_STATE || op == CREATE_SRV || op == CREATE_UAV || op == CREATE_QUERY))
+					PGTDForgetToken(100, base[2]);
+				const uint64_t drawsBefore = sampled ? R->draws : 0;
 				execute(op, base + 2, n);
+				if (sampled) temporalDiagnosticSample(diagnosticTag, op, base + 2, n, drawsBefore);
+				if (op == PRESENT) PGTDPlatformFrame(); // counts source PRESENTs, not display refreshes
 				tail += n * 4 + 8;
 				executed++;
 				if (++sinceYield >= 512) {

@@ -164,7 +164,7 @@ final class SettingsViewController: UITableViewController {
         case .cheats: return engineRunning ? StoryCheats.all.count + storyCheatStart : 0
         case .gyro: return (settings.gyroAim == .off ? 1 : 3) + (settings.tiltSteer == .off ? 1 : 2)
         case .files: return engineRunning ? 0 : fileRows.count
-        case .device: return 11
+        case .device: return 12
         case .language: return 1
         }
     }
@@ -687,7 +687,11 @@ final class SettingsViewController: UITableViewController {
                 content.text = AppLanguage.choose("Share log")
                 content.secondaryText = AppLanguage.choose("Save or send this run's log and the previous one yourself")
                 content.textProperties.color = .systemBlue
-            } else if indexPath.row >= 4 {
+            } else if indexPath.row == 3 {
+                content.text = TemporalDiagnosticsViewController.text("Temporal diagnostics", simplified: "时域诊断", traditional: "時域診斷")
+                content.secondaryText = TemporalDiagnosticsViewController.text("A short, local-only renderer metadata capture", simplified: "短时、仅保存在本机的渲染器元数据采集", traditional: "短時間、僅保存在本機的渲染器中繼資料擷取")
+                content.textProperties.color = .systemBlue
+            } else if indexPath.row >= 5 {
                 // Experimental (v1.4.3, BC3 v1.4.4): on by default; turning one off applies the next time the app starts.
                 let rows: [(String, String, ReferenceWritableKeyPath<GameSettings, Bool>)] = [
                     (AppLanguage.choose("Smarter texture loading"), AppLanguage.choose("Experimental. Keeps the ground and roads from turning grey after long play. Turn off if the game runs out of memory."), \.smarterTextureLoading),
@@ -698,7 +702,7 @@ final class SettingsViewController: UITableViewController {
                     (AppLanguage.choose("Lighter 3D models in memory"), AppLanguage.choose("Experimental, on by default on 4 GB iPhones. The game keeps a second copy of every 3D model after the GPU has it; this hands about 80 MB of it back to iOS. Turn off if the game crashes more often."), \.meshMemoryRelease),
                     (AppLanguage.choose("More engine memory"), AppLanguage.choose("Experimental, off by default. Gives the game about 270 MB more room inside its 4 GB, for fewer stops after long play on 6-8 GB iPhones. Turn off if the game stops more often."), \.smallerEngineHeaps),
                 ]
-                let (title, detail, key) = rows[indexPath.row - 4]
+                let (title, detail, key) = rows[indexPath.row - 5]
                 content.text = title
                 content.secondaryText = detail + " " + AppLanguage.choose("Applies the next time the app starts.")
                 cell.accessoryView = toggle(settings[keyPath: key], label: title) { [weak self] in self?.settings[keyPath: key] = $0 }
@@ -761,7 +765,11 @@ final class SettingsViewController: UITableViewController {
         tableView.deselectRow(at: indexPath, animated: true)
         if sectionKind(indexPath.section) == .device, indexPath.row == 1 { sendLog(); return }
         if sectionKind(indexPath.section) == .device, indexPath.row == 2 { shareLogs(from: tableView.cellForRow(at: indexPath)); return }
-        if sectionKind(indexPath.section) == .device, indexPath.row == 3 { UIApplication.shared.open(Theme.telegramURL); return }
+        if sectionKind(indexPath.section) == .device, indexPath.row == 3 {
+            navigationController?.pushViewController(TemporalDiagnosticsViewController(), animated: true)
+            return
+        }
+        if sectionKind(indexPath.section) == .device, indexPath.row == 4 { UIApplication.shared.open(Theme.telegramURL); return }
         if sectionKind(indexPath.section) == .controls,
            controlsRows[indexPath.row] == .editLayout { editLayout?(); return }
         if sectionKind(indexPath.section) == .cheats, indexPath.row == 0 {

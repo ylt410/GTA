@@ -55,6 +55,16 @@ def main():
         # device; SDK compilation still runs below in the macOS build job.
         run([shutil.which('python3') or 'python3', 'Tests/archive_production.py'])
         run([shutil.which('python3') or 'python3', 'Tests/compressed_shadow_production.py'])
+        temporal = Path(work) / 'temporal-diagnostics'
+        run([cxx, '-std=c++17', '-O2', '-Wall', '-Wextra', '-Werror', '-pthread',
+             'Source/NativeTemporalDiagnostics.cpp', 'Tests/temporal_diagnostics.cpp', '-o', temporal])
+        run([temporal])
+        bridge = Path(work) / 'temporal-engine-bridge'
+        run([cc, '-std=c11', '-O2', '-Wall', '-Wextra', '-Werror', '-I', 'Source',
+             'Tests/temporal_engine_bridge.c', '-lm', '-o', bridge])
+        run([bridge])
+        run([shutil.which('python3') or 'python3', 'Tests/temporal_diagnostics_patch.py'])
+        run([shutil.which('python3') or 'python3', 'Tests/temporal_report_analysis.py'])
         futex = Path(work) / 'futex-waits'
         feature = '-D_DARWIN_C_SOURCE' if platform.system() == 'Darwin' else '-D_GNU_SOURCE'
         run([cc, '-std=c11', feature, '-O2', '-Wall', '-Wextra', '-Werror', '-pthread', '-DPG_FUTEX_TESTING',
@@ -90,6 +100,9 @@ def main():
             run(['xcrun', '--sdk', 'iphoneos', 'clang++', '-fsyntax-only', '-std=c++20',
                  '-fobjc-arc', '-fblocks', '-target', 'arm64-apple-ios16.0', '-isysroot', sdk,
                  '-I', 'Source', 'Source/MetalRenderer/MRFrameReports.mm'])
+            run(['xcrun', '--sdk', 'iphoneos', 'clang++', '-fsyntax-only', '-std=c++20',
+                 '-fobjc-arc', '-fblocks', '-target', 'arm64-apple-ios16.0', '-isysroot', sdk,
+                 '-I', 'Source', 'Source/NativeTemporalDiagnosticsPlatform.mm'])
         else:
             print('Swift/UIKit checks deferred to the same macOS build job.', flush=True)
     print('Performance/cache preflight passed.', flush=True)

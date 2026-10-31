@@ -74,6 +74,12 @@ run('Tools/wasm2c-native', '--enable-threads', '--no-debug-names', '--module-nam
     '--num-outputs=64', str(engine), '-o', 'Generated/game.c')
 # Function names from the engine's name section: the patchers below find their functions by name.
 run('python3', 'Scripts/engine_names.py', '--wasm', str(engine))
+# Optional at runtime, but statically guarded against this exact generated engine ABI.
+# Install before generic rewrites so guards inspect the pinned wasm2c output.
+run('python3', 'Scripts/prepare_temporal_diagnostics.py', '--wasm', str(engine))
+# Execute only the two instrumented packet-writer bodies against synthetic memory.
+# Verify the real generated ABI before compiling the full game; no gameplay runs.
+run('python3', 'Tests/temporal_packet_production.py', '--generated', 'Generated')
 runtime = wabt / 'share/wabt/wasm2c/wasm-rt-impl.c'
 text = runtime.read_text()
 if 'pg_record_trap' not in text:

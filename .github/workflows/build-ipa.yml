@@ -1,8 +1,8 @@
-# Owner-authorized public build. Runs automatically when this repository becomes public.
-name: Build IPA (build 23)
+# Diagnostic-branch variant of the registered workflow. Select this branch explicitly.
+# No automatic trigger and no Release publication; original branches are unchanged.
+name: Build IPA (Temporal input diagnostics only)
 
 on:
-  public:
   workflow_dispatch:
     inputs:
       game_files:
@@ -18,10 +18,10 @@ on:
         default: true
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
-  group: public-ipa-b23-${{ github.repository }}
+  group: temporal-input-diagnostics-${{ github.repository }}
   cancel-in-progress: false
 
 jobs:
@@ -30,7 +30,7 @@ jobs:
     runs-on: macos-15
     timeout-minutes: 240
     env:
-      FROM_UPLOAD: ${{ github.event_name == 'public' || inputs.game_files == 'uploaded with the website builder' }}
+      FROM_UPLOAD: ${{ inputs.game_files == 'uploaded with the website builder' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -127,42 +127,25 @@ jobs:
             ./build_ipa.sh "$SERVER" ${{ github.event_name != 'public' && !inputs.paid_account && '--free' || '' }}
           fi
 
-      - name: Give this update a distinct filename and include the installation guide
+      - name: Label this as diagnostics only and include the exact source
         run: |
-          mv GTA5Port.ipa GTA5Port_1.4.6_b23.ipa
-          cp docs/INSTALL_BUILD_23_ZH.txt Install_Guide_ZH.txt
+          mv GTA5Port.ipa GTA5Port_TemporalInputDiagnostics.ipa
+          printf 'Source commit: %s\nDiagnostics only; no Temporal reconstruction is enabled.\n' "$BUILD_SOURCE_SHA" > Temporal-Diagnostics-Source.txt
 
-      - name: Validate the device IPA before publishing
-        run: /usr/bin/python3 app/Scripts/validate_private_ipa.py GTA5Port_1.4.6_b23.ipa --report IPA-Validation.json
+      - name: Validate the diagnostic device IPA
+        run: /usr/bin/python3 app/Scripts/validate_private_ipa.py GTA5Port_TemporalInputDiagnostics.ipa --report IPA-Validation.json
 
       - uses: actions/upload-artifact@v4
         with:
-          name: GTA5Port-b23-spatial-super-resolution
+          name: GTA5Port-temporal-input-diagnostics-${{ github.run_id }}
           path: |
-            GTA5Port_1.4.6_b23.ipa
+            GTA5Port_TemporalInputDiagnostics.ipa
             IPA-Validation.json
             A17-Codegen-Validation.json
             Build23-Feature-Validation.json
-            Install_Guide_ZH.txt
+            Temporal-Diagnostics-Source.txt
+            docs/TEMPORAL_DIAGNOSTICS_2026-10-31.md
           retention-days: 3
-
-      - name: Publish this owner-authorized build and preserve the previous working IPA
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          tag="native-public-b23-${GITHUB_RUN_ID}"
-          cat > "$RUNNER_TEMP/release-notes.txt" <<'NOTES'
-          MetalFX spatial super resolution and log-driven stability update, v1.4.6 (build 23).
-
-          Graphics now contains Off / Quality / Balanced / Performance spatial MetalFX reconstruction. The selected resolution is the output target; the game renders at a lower internal resolution, preserving aspect ratio and a 360-pixel minimum short axis. The saved mode can change live. Unsupported devices keep the original rendering dimensions. This is spatial reconstruction, not AI/temporal reconstruction or frame generation. The older screen-sharpening toggle is bypassed while a super-resolution mode is active.
-          The submitted build22 phone log proved AttachmentExtension exhaustion at 348 entries. The existing in-memory gameconfig overlay now includes a 500-entry minimum, preserving higher custom values; the actual rewrite is compiled and checked for both platform sections, padding and XML validity. This repair adds about 24 KB of entry payload; it is not presented as an FPS optimization or proof of no entity leaks.
-          Renderer binding plans avoid repeated immutable resource/sampler/array-length scans, bind only consumed vertex streams, and reuse raster-state resolution. Routine sonar/audio trace lines are filtered before logging locks and UI work; errors, warnings, pools and performance records remain. Full trace is available via PG_FULL_ENGINE_TRACE.
-          Build23-Feature-Validation.json contains actual sizing/config checks, scoped host binding metadata measurements and an optional MetalFX pixel probe. Unsupported host MetalFX is explicitly SKIPPED. These checks do not measure iPhone gameplay FPS, CPU/GPU utilization or memory reductions. Existing game quality, dispatch unit counts, core policy and build21 memory protections are retained outside the opt-in internal resolution setting.
-          See Install_Guide_ZH.txt for enabling super resolution and comparing the same route/settings on the phone.
-          NOTES
-          printf '\nSource commit: %s\n' "$BUILD_SOURCE_SHA" >> "$RUNNER_TEMP/release-notes.txt"
-          gh release create "$tag" GTA5Port_1.4.6_b23.ipa IPA-Validation.json A17-Codegen-Validation.json Build23-Feature-Validation.json Install_Guide_ZH.txt --repo "${{ github.repository }}" --target "$BUILD_SOURCE_SHA" \
-            --title "MetalFX Super Resolution + Stability (build 23)" --notes-file "$RUNNER_TEMP/release-notes.txt" --latest=false
 
       - name: Keep the build log if any check fails
         if: failure()
