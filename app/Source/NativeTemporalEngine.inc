@@ -44,7 +44,10 @@ void pg_td_packet(w2c_game *instance, u64 packetAddr) {
     float nearPlane = 0.0f, farPlane = 0.0f;
     float verifyView[16], verifyProjection[16];
     uint64_t verifyViewport = 0;
-    int ok = pgtd_read(instance, viewport + 192ull, camera.view, sizeof camera.view) &&
+    /* Pinned grcViewport::SetCameraMtx stores camera-to-world at +192 and
+       its inverse view at +256; RegenerateMatrices consumes the latter.
+       Schema-1 diagnostics mislabeled +192. Do not regress to that offset. */
+    int ok = pgtd_read(instance, viewport + 256ull, camera.view, sizeof camera.view) &&
              pgtd_read(instance, viewport + 320ull, camera.projection, sizeof camera.projection) &&
              pgtd_read(instance, viewport + 864ull, &width, sizeof width) &&
              pgtd_read(instance, viewport + 868ull, &height, sizeof height) &&
@@ -52,7 +55,7 @@ void pg_td_packet(w2c_game *instance, u64 packetAddr) {
              pgtd_read(instance, viewport + 876ull, &farPlane, sizeof farPlane) &&
              pgtd_read(instance, 12374976ull, &verifyViewport, sizeof verifyViewport) &&
              verifyViewport == viewport &&
-             pgtd_read(instance, viewport + 192ull, verifyView, sizeof verifyView) &&
+             pgtd_read(instance, viewport + 256ull, verifyView, sizeof verifyView) &&
              pgtd_read(instance, viewport + 320ull, verifyProjection, sizeof verifyProjection) &&
              memcmp(camera.view, verifyView, sizeof verifyView) == 0 &&
              memcmp(camera.projection, verifyProjection, sizeof verifyProjection) == 0;

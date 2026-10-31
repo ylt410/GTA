@@ -11,6 +11,7 @@ final class TemporalDiagnosticsViewController: UIViewController {
     private let statusTitle = UILabel()
     private let statusDetail = UILabel()
     private let startButton = UIButton(type: .system)
+    private let cameraProbeButton = UIButton(type: .system)
     private let stopButton = UIButton(type: .system)
     private let shareButton = UIButton(type: .system)
     private var pollTimer: Timer?
@@ -93,7 +94,10 @@ final class TemporalDiagnosticsViewController: UIViewController {
         startButton.configuration?.cornerStyle = .capsule
         startButton.configuration?.baseBackgroundColor = Theme.accent
         startButton.configuration?.baseForegroundColor = UIColor(white: 0.12, alpha: 1)
-        startButton.addAction(UIAction { [weak self] _ in self?.startCapture() }, for: .touchUpInside)
+        startButton.addAction(UIAction { [weak self] _ in self?.startCapture(cameraProbe: false) }, for: .touchUpInside)
+
+        configureButton(cameraProbeButton, title: Self.text("Camera/depth probe (experimental)", simplified: "相机/深度探测（实验性）", traditional: "相機／深度探測（實驗性）"), symbol: "scope")
+        cameraProbeButton.addAction(UIAction { [weak self] _ in self?.startCapture(cameraProbe: true) }, for: .touchUpInside)
 
         configureButton(stopButton, title: Self.text("Stop", simplified: "停止", traditional: "停止"), symbol: "stop.circle")
         stopButton.addAction(UIAction { [weak self] _ in
@@ -105,6 +109,7 @@ final class TemporalDiagnosticsViewController: UIViewController {
         shareButton.addAction(UIAction { [weak self] _ in self?.shareReport() }, for: .touchUpInside)
 
         stack.addArrangedSubview(startButton)
+        stack.addArrangedSubview(cameraProbeButton)
         stack.addArrangedSubview(stopButton)
         stack.addArrangedSubview(shareButton)
 
@@ -113,9 +118,9 @@ final class TemporalDiagnosticsViewController: UIViewController {
         privacy.textColor = Theme.secondaryText
         privacy.numberOfLines = 0
         privacy.text = Self.text(
-            "This does not turn on Temporal MetalFX and does not improve frame rate or image quality. The report includes bounded renderer metadata, including in-game camera/view and transform values; it does not include account information, screenshots, or audio. Nothing uploads automatically; sharing opens the iOS share sheet for you to choose.",
-            simplified: "这不会启用 MetalFX 时域超分，也不会提升帧率或画质。报告会记录有限的渲染器元数据，包括游戏内相机/视图和变换数值；不含账号信息、截图或音频。不会自动上传；点击分享后由你在 iOS 分享菜单中选择。",
-            traditional: "這不會啟用 MetalFX 時域超解析，也不會提升影格率或畫質。報告會記錄有限的渲染器中繼資料，包括遊戲內相機／視圖與變換數值；不含帳號資訊、螢幕截圖或音訊。不會自動上傳；點擊分享後由你在 iOS 分享選單中選擇。"
+            "Neither action enables Temporal MetalFX or improves frame rate/image quality. The optional experimental probe samples a sparse grid of actual depth values and performs camera-only reprojection arithmetic; it does not read color pixels or compute actor motion, may skip ambiguous resources, and adds limited GPU work. Reports contain bounded renderer/camera metadata, not account information, screenshots, or audio. Nothing uploads automatically; sharing opens the iOS share sheet for you to choose.",
+            simplified: "两种操作都不会启用 MetalFX 时域超分，也不会提升帧率或画质。可选的实验性探测会对实际深度值进行稀疏取样并执行仅基于相机的重投影运算；不会读取颜色像素或计算角色运动，遇到含糊资源时可能跳过，并会增加有限 GPU 工作。报告含有限渲染器/相机元数据，不含账号信息、截图或音频。不会自动上传；分享时由你在 iOS 分享菜单中选择。",
+            traditional: "兩種操作都不會啟用 MetalFX 時域超解析，也不會提升影格率或畫質。可選的實驗性探測會對實際深度值進行稀疏取樣並執行僅基於相機的重投影運算；不會讀取色彩像素或計算角色運動，遇到含糊資源時可能跳過，並會增加有限 GPU 工作。報告含有限渲染器／相機中繼資料，不含帳號資訊、螢幕截圖或音訊。不會自動上傳；分享時由你在 iOS 分享選單中選擇。"
         )
         stack.addArrangedSubview(privacy)
 
@@ -158,7 +163,7 @@ final class TemporalDiagnosticsViewController: UIViewController {
         button.contentHorizontalAlignment = .center
     }
 
-    private func startCapture() {
+    private func startCapture(cameraProbe: Bool) {
         guard status == .idle || status == .ready || status == .failed else { return }
         if let reportURL, FileManager.default.fileExists(atPath: reportURL.path) {
             guard let signature = reportSignature(at: reportURL), Self.sharedReportSignature == signature else {
@@ -173,14 +178,21 @@ final class TemporalDiagnosticsViewController: UIViewController {
                 return
             }
         }
+        let title = cameraProbe
+            ? Self.text("Start the camera/depth probe?", simplified: "开始相机/深度探测？", traditional: "開始相機／深度探測？")
+            : Self.text("Start a short diagnostics capture?", simplified: "开始短时诊断采集？", traditional: "開始短時間診斷擷取？")
+        let message = cameraProbe
+            ? Self.text("Set SR to Off in Graphics settings before starting. After a 3-second delay this samples a sparse grid of actual depth values and evaluates camera-only reprojection. It does not read color pixels, produce actor motion, or enable Temporal; ambiguous targets may be skipped. It adds limited GPU work.", simplified: "开始前请在图像设置中将 SR 设为 Off。3 秒延迟后将对实际深度值稀疏取样并评估仅基于相机的重投影。不会读取颜色像素、产生角色运动数据或启用时域超分；目标含糊时可能跳过，并会增加有限 GPU 工作。", traditional: "開始前請在圖像設定中將 SR 設為 Off。3 秒延遲後會對實際深度值稀疏取樣並評估僅基於相機的重投影。不會讀取色彩像素、產生角色運動資料或啟用時域超解析；目標含糊時可能跳過，並會增加有限 GPU 工作。")
+            : Self.text("Set SR to Off in Graphics settings before starting. Capture begins after a 3-second delay, so return to gameplay before then. This only records bounded metadata; it does not enable Temporal MetalFX or change spatial upscaling.", simplified: "开始前请在图像设置中将 SR 设为 Off。采集会在 3 秒后开始，请在此之前返回游戏。本操作仅记录有限元数据，不会启用 MetalFX 时域超分，也不会更改空间升频设置。", traditional: "開始前請在圖像設定中將 SR 設為 Off。擷取會在 3 秒後開始，請在此之前返回遊戲。本操作僅記錄有限中繼資料，不會啟用 MetalFX 時域超解析，也不會變更空間升頻設定。")
         let alert = UIAlertController(
-            title: Self.text("Start a short diagnostics capture?", simplified: "开始短时诊断采集？", traditional: "開始短時間診斷擷取？"),
-            message: Self.text("Set SR to Off in Graphics settings before starting. Capture begins after a 3-second delay, so return to gameplay before then. This only records bounded metadata; it does not enable Temporal MetalFX or change spatial upscaling.", simplified: "开始前请在图像设置中将 SR 设为 Off。采集会在 3 秒后开始，请在此之前返回游戏。本操作仅记录有限元数据，不会启用 MetalFX 时域超分，也不会更改空间升频设置。", traditional: "開始前請在圖像設定中將 SR 設為 Off。擷取會在 3 秒後開始，請在此之前返回遊戲。本操作僅記錄有限中繼資料，不會啟用 MetalFX 時域超解析，也不會變更空間升頻設定。"),
+            title: title,
+            message: message,
             preferredStyle: .alert
         )
         alert.addAction(UIAlertAction(title: AppLanguage.choose("Cancel"), style: .cancel))
         alert.addAction(UIAlertAction(title: Self.text("Start", simplified: "开始", traditional: "開始"), style: .default) { [weak self] _ in
-            PGTemporalDiagnosticsStart()
+            if cameraProbe { PGTemporalDiagnosticsStartCameraProbe() }
+            else { PGTemporalDiagnosticsStart() }
             self?.refreshStatus()
         })
         present(alert, animated: true)
@@ -198,7 +210,9 @@ final class TemporalDiagnosticsViewController: UIViewController {
             title = Self.text("Starting in 3 seconds…", simplified: "3 秒后开始…", traditional: "3 秒後開始…")
             detail = Self.text("You can stop before capture begins.", simplified: "采集开始前仍可停止。", traditional: "擷取開始前仍可停止。")
         case .recording:
-            title = Self.text("Recording bounded metadata…", simplified: "正在采集有限元数据…", traditional: "正在擷取有限中繼資料…")
+            title = PGTemporalDiagnosticsIsCameraProbe() != 0
+                ? Self.text("Camera/depth probe running…", simplified: "相机/深度探测进行中…", traditional: "相機／深度探測進行中…")
+                : Self.text("Recording bounded metadata…", simplified: "正在采集有限元数据…", traditional: "正在擷取有限中繼資料…")
             detail = Self.text("It stops after at most 60 game source-rendered frames (not display refreshes) or 15 seconds.", simplified: "最多记录 60 个游戏源渲染帧（不是屏幕刷新帧）或 15 秒后自动停止。", traditional: "最多記錄 60 個遊戲源渲染影格（不是螢幕更新影格）或 15 秒後自動停止。")
         case .saving:
             title = Self.text("Saving report…", simplified: "正在保存报告…", traditional: "正在儲存報告…")
@@ -229,6 +243,8 @@ final class TemporalDiagnosticsViewController: UIViewController {
         shareButton.alpha = exists ? 1 : 0.45
         startButton.isEnabled = !active && status != .saving
         startButton.alpha = startButton.isEnabled ? 1 : 0.45
+        cameraProbeButton.isEnabled = !active && status != .saving
+        cameraProbeButton.alpha = cameraProbeButton.isEnabled ? 1 : 0.45
         startButton.configuration?.title = active
             ? Self.text("Capture in progress", simplified: "采集中", traditional: "擷取中")
             : Self.text("Start capture", simplified: "开始采集", traditional: "開始擷取")

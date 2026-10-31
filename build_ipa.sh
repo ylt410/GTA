@@ -34,6 +34,17 @@ if [ -n "$SERVER" ]; then
 fi
 "$PY" Scripts/check_game_files.py --mirror "$MIRROR"
 "$PY" Scripts/prepare.py --mirror "$MIRROR"
+# Embed the source revision used for this local IPA. This is distinct from the
+# fixed baseline revision reported by temporal diagnostics.
+BUILD_COMMIT="$(git -C .. rev-parse --verify HEAD 2>/dev/null || true)"
+if [[ "$BUILD_COMMIT" =~ ^[0-9a-fA-F]{40}$ ]]; then
+  BUILD_COMMIT_LOWER="$(printf '%s' "$BUILD_COMMIT" | tr '[:upper:]' '[:lower:]')"
+  /usr/libexec/PlistBuddy -c "Set :PGDiagnosticBuildSHA $BUILD_COMMIT_LOWER" App/Info.plist 2>/dev/null || \
+    /usr/libexec/PlistBuddy -c "Add :PGDiagnosticBuildSHA string $BUILD_COMMIT_LOWER" App/Info.plist
+else
+  /usr/libexec/PlistBuddy -c "Set :PGDiagnosticBuildSHA unknown" App/Info.plist 2>/dev/null || \
+    /usr/libexec/PlistBuddy -c "Add :PGDiagnosticBuildSHA string unknown" App/Info.plist
+fi
 # Exercise the real Foundation asset read path after its generated headers
 # exist, before spending time compiling the native game engine.
 sh Tests/check_local_asset_reads.sh 2>&1 | tee Build/local-asset-reads.log

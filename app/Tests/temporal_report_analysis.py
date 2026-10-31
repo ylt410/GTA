@@ -66,7 +66,7 @@ def report(records: list[dict] | None = None) -> dict:
     return {
         "schema": 1,
         "purpose": "diagnostics only",
-        "engineSHA256": "a" * 64,
+        "engineSHA256": "11ca8d2c04c5e843d18ff4aea4899d72c86973c6b031df334e67c446b2ae83e0",
         "baseCommit": "b" * 40,
         "session": "0123456789abcdef",
         "sourcePresentCount": 3,
@@ -89,6 +89,63 @@ def report(records: list[dict] | None = None) -> dict:
                    stage=105, opcode=7),
         ],
     }
+
+
+def probe_frame(frame: int = 1, *, status: str = "ok") -> dict:
+    return {
+        "frame": frame, "width": 1600, "height": 900, "depthToken": 31,
+        "depthFormat": 2, "sceneColorToken": 21, "uiColorToken": 22,
+        "cameraVPResidual": 0.000001, "status": status,
+        "validDepthSamples": 1200, "backgroundSamples": 500, "invalidDepthSamples": 604,
+        "validMotionSamples": 900, "cpuGpuComparedSamples": 850,
+        "cpuGpuMismatchSamples": 3, "maxErrorPixels": 0.25,
+        "meanMotionPixels": 0.75, "maxMotionPixels": 4.0,
+        "hudAfterBoundary": True,
+    }
+
+
+def camera_probe(requested: bool = True) -> dict:
+    return {
+        "requested": requested,
+        "mode": "camera-only-depth-probe" if requested else "off",
+        "session": "0123456789abcdef",
+        "grid": [64, 36], "maximumDispatches": 12,
+        "sourceFrames": 60 if requested else 0,
+        "candidates": 4 if requested else 0,
+        "cameraVerifiedFrames": 8 if requested else 0,
+        "boundaryFrames": 7 if requested else 0,
+        "scheduled": 3 if requested else 0,
+        "completed": 1 if requested else 0,
+        "gpuFailures": 1 if requested else 0, "busySkips": 1 if requested else 0,
+        "contractRejects": 0, "historyResets": 2 if requested else 0,
+        "pending": 1 if requested else 0,
+        "partialFrame": False, "timedOut": requested, "readyForTemporal": False,
+        "limitations": "Camera-only reprojection; not actor motion or reconstruction readiness.",
+        "rejections": {"no-scene-depth": 1} if requested else {},
+        "frames": [probe_frame(2, status="timed-out"), probe_frame(4),
+                   probe_frame(5, status="gpu-failed")] if requested else [],
+    }
+
+
+def report_schema2() -> dict:
+    value = report()
+    value["schema"] = 2
+    value["cameraLayoutVersion"] = 2
+    value["baseCommitRole"] = "baseline source revision"
+    value["buildCommit"] = "c" * 40
+    value["tokenSemantics"] = (
+        "Opaque anonymous token numbers are not raw identities; transient mapping eviction can split continuity."
+    )
+    value["cameraProbe"] = camera_probe()
+    value["stats"].update({
+        "quotaDroppedRecords": 25,
+        "transientTokenEvictions": 5,
+        "resourceTokenOverflow": 0,
+        "candidateTokenOverflow": 0,
+        "transientTokenOverflow": 0,
+        "downsampledFrames": 2,
+    })
+    return value
 
 
 def encode(value: dict) -> bytes:
@@ -125,6 +182,9 @@ class TemporalReportAnalysisTest(unittest.TestCase):
         self.assertEqual(attachments["omittedSubresourceComparisons"], 1)
         self.assertFalse(summary["readyForTemporal"])
         self.assertIn("motion-vector", summary["temporalReadinessReason"])
+        self.assertIn("camera-to-world", summary["cameraLayoutWarning"])
+        self.assertIn("offset 192", summary["cameraLayoutWarning"])
+        self.assertIn("not inverted", summary["cameraLayoutWarning"])
         self.assertIn("not a dropped-frame rate", summary["lossAndUnknowns"]["missesMeaning"])
         self.assertNotIn("fps", json.dumps(summary).lower())
 
@@ -149,8 +209,149 @@ class TemporalReportAnalysisTest(unittest.TestCase):
         with self.assertRaisesRegex(analyzer.ReportError, "length 4"):
             analyzer.analyze_report_bytes(encode(value))
         value = report([])
-        value["schema"] = 2
+        value["schema"] = 3
         with self.assertRaisesRegex(analyzer.ReportError, "unsupported schema"):
+            analyzer.analyze_report_bytes(encode(value))
+
+    def test_schema2_probe_sampling_and_build_metadata(self):
+        summary = analyzer.analyze_report_bytes(encode(report_schema2()))
+        self.assertEqual(summary["schema"], 2)
+        self.assertEqual(summary["buildCommit"], "c" * 40)
+        self.assertEqual(summary["baseCommitRole"], "baseline source revision")
+        self.assertEqual(summary["cameraLayoutVersion"], 2)
+        self.assertIn("offset 256", summary["cameraCandidateChecks"]["cameraLayoutNote"])
+        self.assertIn("offset 320", summary["cameraCandidateChecks"]["cameraLayoutNote"])
+        self.assertIn("transient mapping eviction", summary["tokenSemantics"])
+        probe = summary["cameraProbe"]
+        self.assertEqual(probe["mode"], "camera-only-depth-probe")
+        self.assertFalse(probe["readyForTemporal"])
+        self.assertEqual(probe["frames"][0]["validDepthSamples"], 1200)
+        self.assertEqual(probe["rejections"]["no-scene-depth"], 1)
+        sampling = summary["lossAndUnknowns"]["intentionalDiagnosticSampling"]
+        self.assertEqual(sampling["quotaDroppedRecords"], 25)
+        self.assertEqual(sampling["downsampledFrames"], 2)
+        self.assertIn("not missed or dropped game frames", sampling["note"])
+        self.assertEqual(summary["collectorStats"]["transientTokenEvictions"], 5)
+        self.assertTrue(any("Transient identity mappings were evicted" in warning
+                            for warning in summary["lossAndUnknowns"]["warnings"]))
+        self.assertFalse(summary["readyForTemporal"])
+        self.assertIn("motion-vector", summary["temporalReadinessReason"])
+
+    def test_schema2_default_off_and_unknown_build_commit(self):
+        value = report_schema2()
+        value["buildCommit"] = "unknown"
+        value["cameraProbe"] = camera_probe(requested=False)
+        summary = analyzer.analyze_report_bytes(encode(value))
+        self.assertEqual(summary["buildCommit"], "unknown")
+        self.assertFalse(summary["cameraProbe"]["requested"])
+        self.assertFalse(summary["cameraProbe"]["partialFrame"])
+        self.assertEqual(summary["cameraProbe"]["frames"], [])
+        self.assertEqual(summary["cameraProbe"]["sourceFrames"], 0)
+        value["cameraProbe"]["partialFrame"] = True
+        with self.assertRaisesRegex(analyzer.ReportError, "unrequested cameraProbe"):
+            analyzer.analyze_report_bytes(encode(value))
+
+    def test_schema2_partial_source_frame_boundary_is_allowed_only_when_marked(self):
+        value = report_schema2()
+        probe = value["cameraProbe"]
+        probe["partialFrame"] = True
+        probe["boundaryFrames"] = probe["sourceFrames"] + 1
+        probe["frames"][-1]["frame"] = probe["sourceFrames"] + 1
+        summary = analyzer.analyze_report_bytes(encode(value))
+        self.assertTrue(summary["cameraProbe"]["partialFrame"])
+        self.assertEqual(summary["cameraProbe"]["frames"][-1]["frame"], 61)
+
+        value["cameraProbe"]["partialFrame"] = False
+        with self.assertRaisesRegex(analyzer.ReportError, "boundaryFrames exceeds"):
+            analyzer.analyze_report_bytes(encode(value))
+
+        value["cameraProbe"]["boundaryFrames"] = value["cameraProbe"]["sourceFrames"]
+        with self.assertRaisesRegex(analyzer.ReportError, "frame exceeds sourceFrames plus partialFrame"):
+            analyzer.analyze_report_bytes(encode(value))
+
+        value = report_schema2()
+        value["cameraProbe"]["partialFrame"] = True
+        value["cameraProbe"]["cameraVerifiedFrames"] = value["cameraProbe"]["sourceFrames"] + 1
+        with self.assertRaisesRegex(analyzer.ReportError, "cameraVerifiedFrames exceeds"):
+            analyzer.analyze_report_bytes(encode(value))
+
+    def test_schema2_dispatch_ledger_and_timeout_are_consistent(self):
+        value = report_schema2()
+        value["cameraProbe"]["pending"] = 0
+        value["cameraProbe"]["timedOut"] = False
+        with self.assertRaisesRegex(analyzer.ReportError, "ledger does not balance"):
+            analyzer.analyze_report_bytes(encode(value))
+
+        value = report_schema2()
+        value["cameraProbe"]["timedOut"] = False
+        with self.assertRaisesRegex(analyzer.ReportError, "timedOut must be true"):
+            analyzer.analyze_report_bytes(encode(value))
+
+        value = report_schema2()
+        value["cameraProbe"]["scheduled"] = 2
+        with self.assertRaisesRegex(analyzer.ReportError, "scheduled must equal"):
+            analyzer.analyze_report_bytes(encode(value))
+
+    def test_schema2_rejects_missing_stats_bad_build_and_probe_contract(self):
+        value = report_schema2()
+        del value["stats"]["candidateTokenOverflow"]
+        with self.assertRaisesRegex(analyzer.ReportError, "stats missing required fields"):
+            analyzer.analyze_report_bytes(encode(value))
+
+        value = report_schema2()
+        del value["cameraLayoutVersion"]
+        with self.assertRaisesRegex(analyzer.ReportError, "missing required fields: cameraLayoutVersion"):
+            analyzer.analyze_report_bytes(encode(value))
+
+        value = report_schema2()
+        value["cameraLayoutVersion"] = 1
+        with self.assertRaisesRegex(analyzer.ReportError, "cameraLayoutVersion must be 2"):
+            analyzer.analyze_report_bytes(encode(value))
+
+        value = report_schema2()
+        value["buildCommit"] = "not-a-commit"
+        with self.assertRaisesRegex(analyzer.ReportError, "buildCommit"):
+            analyzer.analyze_report_bytes(encode(value))
+
+        value = report_schema2()
+        value["cameraProbe"]["readyForTemporal"] = True
+        with self.assertRaisesRegex(analyzer.ReportError, "must be false"):
+            analyzer.analyze_report_bytes(encode(value))
+
+        value = report_schema2()
+        value["cameraProbe"]["frames"][0]["validMotionSamples"] = 2305
+        with self.assertRaisesRegex(analyzer.ReportError, "<= 2304"):
+            analyzer.analyze_report_bytes(encode(value))
+
+        value = report_schema2()
+        del value["cameraProbe"]["frames"][0]["cpuGpuMismatchSamples"]
+        with self.assertRaisesRegex(analyzer.ReportError, "cpuGpuMismatchSamples"):
+            analyzer.analyze_report_bytes(encode(value))
+
+        value = report_schema2()
+        value["cameraProbe"]["frames"] *= 7
+        with self.assertRaisesRegex(analyzer.ReportError, "at most 12"):
+            analyzer.analyze_report_bytes(encode(value))
+
+    def test_schema2_rejects_bad_probe_session_counts_and_commit_role(self):
+        value = report_schema2()
+        value["cameraProbe"]["session"] = "ffffffffffffffff"
+        with self.assertRaisesRegex(analyzer.ReportError, "match the root session"):
+            analyzer.analyze_report_bytes(encode(value))
+
+        value = report_schema2()
+        value["cameraProbe"]["scheduled"] = 13
+        with self.assertRaisesRegex(analyzer.ReportError, "exceeds maximumDispatches"):
+            analyzer.analyze_report_bytes(encode(value))
+
+        value = report_schema2()
+        value["baseCommitRole"] = 123
+        with self.assertRaisesRegex(analyzer.ReportError, "baseCommitRole"):
+            analyzer.analyze_report_bytes(encode(value))
+
+        value = report_schema2()
+        value["cameraProbe"]["rejections"] = {"/tmp/private-pointer": 1}
+        with self.assertRaisesRegex(analyzer.ReportError, "reason codes"):
             analyzer.analyze_report_bytes(encode(value))
 
     def test_nonfinite_and_duplicate_keys_are_rejected(self):

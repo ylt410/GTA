@@ -17,6 +17,17 @@ constexpr uint32_t kEntityKindLast = 8;
 constexpr uint32_t kPaletteKind = 200;
 constexpr uint32_t kEntityClassCount = 16;
 constexpr uint64_t kHashSalt = UINT64_C(0x9e3779b97f4a7c15);
+constexpr uint32_t kTransientWays = 4;
+constexpr uint32_t kTransientSets = PGTD_TRANSIENT_TOKEN_CAPACITY / kTransientWays;
+constexpr uint32_t kStageCount = kStageKindLast - kStageKindFirst + 1;
+constexpr uint32_t kSelectedRecordKeys = 4;
+constexpr uint32_t kSelectedRecordsPerKey = 2;
+constexpr uint32_t kGeneralRecordsPerFrame = PGTD_RECORDS_PER_FRAME;
+static_assert(PGTD_RECORDS_PER_FRAME >= 1u + 2u * kStageCount +
+	kSelectedRecordKeys * kSelectedRecordsPerKey,
+	"per-frame record budget must preserve PRESENT, stage markers, and selected draws");
+static_assert(PGTD_RECORDS_PER_FRAME <= PGTD_MAX_RECORDS / 60u,
+	"sixty complete frames must fit in the bounded report");
 
 struct TokenEntry {
 	uint64_t raw;
@@ -63,11 +74,32 @@ struct ThreadState {
 	ScopeContext context;
 	ScopeFrame stack[PGTD_SCOPE_MAX_DEPTH];
 	bool poisoned;
+	uint32_t pendingTagFlags;
 };
 
 struct SelectedKey {
 	uint64_t key;
 	uint32_t countThisFrame;
+	bool used;
+};
+
+struct FrameRecordStore {
+	PGTDMetalSample present;
+	PGTDMetalSample stageTargets[kStageCount];
+	PGTDMetalSample stageDraws[kStageCount];
+	PGTDMetalSample selected[kSelectedRecordKeys][kSelectedRecordsPerKey];
+	PGTDMetalSample general[kGeneralRecordsPerFrame];
+	uint32_t selectedCounts[kSelectedRecordKeys];
+	uint32_t generalCount;
+	uint64_t generalSeen;
+	bool hasPresent;
+	bool downsampled;
+	bool hasStageTargets[kStageCount];
+	bool hasStageDraws[kStageCount];
+};
+
+struct SelectedRecordKey {
+	uint32_t token;
 	bool used;
 };
 
@@ -78,12 +110,17 @@ std::atomic<uint32_t> gEpoch{0};
 PGTDReport gReport{};
 PacketEntry gPackets[PGTD_PACKET_SLOTS]{};
 TokenEntry gTokens[PGTD_TOKEN_CAPACITY]{};
+TokenEntry gCandidateTokens[PGTD_CANDIDATE_TOKEN_CAPACITY]{};
+TokenEntry gTransientTokens[PGTD_TRANSIENT_TOKEN_CAPACITY]{};
+uint32_t gTransientVictim[kTransientSets]{};
 uint32_t gNextToken = 1;
 uint64_t gNextThread = 1;
 uint64_t gNextCookie = 1;
 uint64_t gTagSequence = 0;
 uint32_t gFrameClaims = 0;
 SelectedKey gSelectedKeys[kEntityClassCount][2]{};
+SelectedRecordKey gSelectedRecordKeys[kSelectedRecordKeys]{};
+FrameRecordStore gFrameRecords{};
 thread_local ThreadState tState{};
 
 uint64_t mix64(uint64_t x) {
@@ -119,6 +156,7 @@ uint32_t tokenLocked(uint32_t domain, uint64_t raw) {
 	}
 	if (firstReusable == PGTD_TOKEN_CAPACITY || gNextToken == 0) {
 		++gReport.stats.tokenOverflow;
+		++gReport.stats.resourceTokenOverflow;
 		return 0;
 	}
 	TokenEntry &entry = gTokens[firstReusable];
@@ -126,20 +164,208 @@ uint32_t tokenLocked(uint32_t domain, uint64_t raw) {
 	return entry.token;
 }
 
+uint32_t candidateTokenLocked(uint32_t domain, uint64_t raw) {
+	if (raw == 0) return 0;
+	const uint32_t start = static_cast<uint32_t>(
+		mix64(raw ^ (static_cast<uint64_t>(domain) * kHashSalt)) % PGTD_CANDIDATE_TOKEN_CAPACITY);
+	uint32_t firstReusable = PGTD_CANDIDATE_TOKEN_CAPACITY;
+	for (uint32_t n = 0; n < PGTD_CANDIDATE_TOKEN_CAPACITY; ++n) {
+		const uint32_t index = (start + n) % PGTD_CANDIDATE_TOKEN_CAPACITY;
+		TokenEntry &entry = gCandidateTokens[index];
+		if (entry.used) {
+			if (entry.domain == domain && entry.raw == raw) return entry.token;
+			continue;
+		}
+		if (firstReusable == PGTD_CANDIDATE_TOKEN_CAPACITY) firstReusable = index;
+		if (!entry.tombstone) break;
+	}
+	if (firstReusable == PGTD_CANDIDATE_TOKEN_CAPACITY || gNextToken == 0) {
+		++gReport.stats.tokenOverflow;
+		++gReport.stats.candidateTokenOverflow;
+		return 0;
+	}
+	TokenEntry &entry = gCandidateTokens[firstReusable];
+	entry = {raw, domain, gNextToken++, true, false};
+	return entry.token;
+}
+
+uint32_t transientTokenLocked(uint32_t domain, uint64_t raw) {
+	if (raw == 0) return 0;
+	const uint32_t set = static_cast<uint32_t>(
+		mix64(raw ^ (static_cast<uint64_t>(domain) * kHashSalt)) % kTransientSets);
+	const uint32_t start = set * kTransientWays;
+	uint32_t empty = PGTD_TRANSIENT_TOKEN_CAPACITY;
+	for (uint32_t way = 0; way < kTransientWays; ++way) {
+		const uint32_t index = start + way;
+		TokenEntry &entry = gTransientTokens[index];
+		if (entry.used && entry.domain == domain && entry.raw == raw) return entry.token;
+		if (!entry.used && empty == PGTD_TRANSIENT_TOKEN_CAPACITY) empty = index;
+	}
+	if (gNextToken == 0) {
+		++gReport.stats.tokenOverflow;
+		++gReport.stats.transientTokenOverflow;
+		return 0;
+	}
+	uint32_t index = empty;
+	if (index == PGTD_TRANSIENT_TOKEN_CAPACITY) {
+		index = start + gTransientVictim[set];
+		gTransientVictim[set] = (gTransientVictim[set] + 1) % kTransientWays;
+		++gReport.stats.transientTokenEvictions;
+	}
+	gTransientTokens[index] = {raw, domain, gNextToken++, true, false};
+	return gTransientTokens[index].token;
+}
+
 void clearSidebandLocked() {
 	std::memset(gPackets, 0, sizeof(gPackets));
+}
+
+void countRecordDropLocked() {
+	++gReport.stats.quotaDroppedRecords;
+	gFrameRecords.downsampled = true;
+}
+
+void appendReportRecordLocked(const PGTDMetalSample &sample) {
+	if (gReport.recordCount >= PGTD_MAX_RECORDS) {
+		++gReport.stats.recordOverflow;
+		++gReport.stats.truncatedRecords;
+		return;
+	}
+	gReport.samples[gReport.recordCount++] = sample;
+}
+
+void flushFrameRecordsLocked() {
+	uint32_t fixedCount = gFrameRecords.hasPresent ? 1u : 0u;
+	for (uint32_t i = 0; i < kStageCount; ++i) {
+		fixedCount += gFrameRecords.hasStageTargets[i] ? 1u : 0u;
+		fixedCount += gFrameRecords.hasStageDraws[i] ? 1u : 0u;
+	}
+	for (uint32_t i = 0; i < kSelectedRecordKeys; ++i)
+		fixedCount += gFrameRecords.selectedCounts[i];
+	const uint32_t generalLimit = fixedCount < PGTD_RECORDS_PER_FRAME
+		? PGTD_RECORDS_PER_FRAME - fixedCount : 0u;
+	const uint32_t generalToWrite = gFrameRecords.generalCount < generalLimit
+		? gFrameRecords.generalCount : generalLimit;
+	if (generalToWrite < gFrameRecords.generalCount) {
+		gReport.stats.quotaDroppedRecords += gFrameRecords.generalCount - generalToWrite;
+		gFrameRecords.downsampled = true;
+	}
+	// Selection priority must not change the producer-to-consumer chronology.
+	// Gather a bounded set of pointers, sort it by sequence, then copy to report.
+	const PGTDMetalSample *ordered[PGTD_RECORDS_PER_FRAME]{};
+	uint32_t orderedCount = 0;
+	if (gFrameRecords.hasPresent) ordered[orderedCount++] = &gFrameRecords.present;
+	for (uint32_t i = 0; i < kStageCount; ++i) {
+		if (gFrameRecords.hasStageTargets[i]) ordered[orderedCount++] = &gFrameRecords.stageTargets[i];
+	}
+	for (uint32_t i = 0; i < kStageCount; ++i) {
+		if (gFrameRecords.hasStageDraws[i]) ordered[orderedCount++] = &gFrameRecords.stageDraws[i];
+	}
+	for (uint32_t i = 0; i < kSelectedRecordKeys; ++i) {
+		for (uint32_t j = 0; j < gFrameRecords.selectedCounts[i]; ++j) {
+			ordered[orderedCount++] = &gFrameRecords.selected[i][j];
+		}
+	}
+	for (uint32_t i = 0; i < generalToWrite; ++i) {
+		ordered[orderedCount++] = &gFrameRecords.general[i];
+	}
+	for (uint32_t i = 1; i < orderedCount; ++i) {
+		const PGTDMetalSample *sample = ordered[i];
+		uint32_t j = i;
+		while (j > 0 && ordered[j - 1]->tag.sequence > sample->tag.sequence) {
+			ordered[j] = ordered[j - 1];
+			--j;
+		}
+		ordered[j] = sample;
+	}
+	for (uint32_t i = 0; i < orderedCount; ++i) appendReportRecordLocked(*ordered[i]);
+	if (gFrameRecords.downsampled) ++gReport.stats.downsampledFrames;
+	std::memset(&gFrameRecords, 0, sizeof(gFrameRecords));
+}
+
+int32_t selectedRecordKeyLocked(uint32_t token) {
+	if (token == 0) return -1;
+	for (uint32_t i = 0; i < kSelectedRecordKeys; ++i) {
+		if (gSelectedRecordKeys[i].used && gSelectedRecordKeys[i].token == token)
+			return static_cast<int32_t>(i);
+	}
+	for (uint32_t i = 0; i < kSelectedRecordKeys; ++i) {
+		if (!gSelectedRecordKeys[i].used) {
+			gSelectedRecordKeys[i] = {token, true};
+			return static_cast<int32_t>(i);
+		}
+	}
+	return -1;
+}
+
+void stageRecordLocked(const PGTDMetalSample &sample) {
+	FrameRecordStore &frame = gFrameRecords;
+	if (sample.opcode == kPresentOp) {
+		if (frame.hasPresent) countRecordDropLocked();
+		else {
+			frame.present = sample;
+			frame.hasPresent = true;
+		}
+		return;
+	}
+	if (sample.tag.stage >= kStageKindFirst && sample.tag.stage <= kStageKindLast) {
+		const uint32_t stage = sample.tag.stage - kStageKindFirst;
+		if (sample.opcode == kSetRenderTargetsOp) {
+			if (frame.hasStageTargets[stage]) countRecordDropLocked();
+			else {
+				frame.stageTargets[stage] = sample;
+				frame.hasStageTargets[stage] = true;
+			}
+			return;
+		}
+	}
+	if (sample.opcode == kDrawOp &&
+		(sample.tag.flags & PGTD_TAG_FLAG_SELECTED_SAMPLE) != 0) {
+		const int32_t keyIndex = selectedRecordKeyLocked(sample.tag.entityKey);
+		if (keyIndex >= 0 && frame.selectedCounts[keyIndex] < kSelectedRecordsPerKey) {
+			frame.selected[keyIndex][frame.selectedCounts[keyIndex]++] = sample;
+			return;
+		}
+		countRecordDropLocked();
+		return;
+	}
+	if (sample.opcode == kDrawOp &&
+		sample.tag.stage >= kStageKindFirst && sample.tag.stage <= kStageKindLast) {
+		const uint32_t stage = sample.tag.stage - kStageKindFirst;
+		if (frame.hasStageDraws[stage]) countRecordDropLocked();
+		else {
+			frame.stageDraws[stage] = sample;
+			frame.hasStageDraws[stage] = true;
+		}
+		return;
+	}
+	if (frame.generalSeen != UINT64_MAX) ++frame.generalSeen;
+	if (frame.generalCount < kGeneralRecordsPerFrame) {
+		frame.general[frame.generalCount++] = sample;
+		return;
+	}
+	const uint64_t pick = mix64(sample.tag.sequence ^ gReport.session ^
+		(static_cast<uint64_t>(sample.frame) * kHashSalt)) % frame.generalSeen;
+	if (pick < kGeneralRecordsPerFrame) {
+		frame.general[static_cast<uint32_t>(pick)] = sample;
+	}
+	countRecordDropLocked();
 }
 
 void clearReportLocked(uint64_t session) {
 	std::memset(&gReport, 0, sizeof(gReport));
 	gReport.session = session;
 	std::memset(gTokens, 0, sizeof(gTokens));
-	gNextToken = 1;
+	std::memset(gCandidateTokens, 0, sizeof(gCandidateTokens));
+	std::memset(gTransientTokens, 0, sizeof(gTransientTokens));
+	std::memset(gTransientVictim, 0, sizeof(gTransientVictim));
 	gNextThread = 1;
 	gNextCookie = 1;
 	gTagSequence = 0;
 	gFrameClaims = 0;
 	std::memset(gSelectedKeys, 0, sizeof(gSelectedKeys));
+	std::memset(gSelectedRecordKeys, 0, sizeof(gSelectedRecordKeys));
+	std::memset(&gFrameRecords, 0, sizeof(gFrameRecords));
 	clearSidebandLocked();
 }
 
@@ -181,17 +407,17 @@ PGTDTag makeTagLocked(ThreadState &thread, const PGTDCamera *camera) {
 	tag.flags = thread.context.flags;
 	tag.entityKey = 0;
 	if ((thread.context.flags & PGTD_TAG_FLAG_KEY_VALID) != 0) {
-		tag.entityKey = tokenLocked(6u, thread.context.rawCandidateKey);
+		tag.entityKey = candidateTokenLocked(6u, thread.context.rawCandidateKey);
 		if (tag.entityKey == 0) tag.flags &= ~PGTD_TAG_FLAG_KEY_VALID;
 	}
-	tag.entityToken = tokenLocked(1u, thread.context.entityIdentity);
-	tag.auxiliaryToken = tokenLocked(2u, thread.context.auxiliaryIdentity);
-	tag.rootMatrixToken = tokenLocked(4u, thread.context.rootMatrixIdentity);
-	tag.paletteToken = tokenLocked(3u, thread.context.paletteIdentity);
+	tag.entityToken = transientTokenLocked(1u, thread.context.entityIdentity);
+	tag.auxiliaryToken = transientTokenLocked(2u, thread.context.auxiliaryIdentity);
+	tag.rootMatrixToken = transientTokenLocked(4u, thread.context.rootMatrixIdentity);
+	tag.paletteToken = transientTokenLocked(3u, thread.context.paletteIdentity);
 	tag.scopeDepth = thread.depth;
 	if (camera != nullptr) {
 		tag.camera = *camera;
-		tag.viewportToken = tokenLocked(5u, camera->rawViewport);
+		tag.viewportToken = transientTokenLocked(5u, camera->rawViewport);
 		tag.camera.rawViewport = 0;
 		if (!camera->valid || !finiteCamera(*camera)) {
 			tag.flags |= PGTD_TAG_FLAG_CAMERA_INVALID;
@@ -269,6 +495,7 @@ uint64_t PGTDBegin(void) {
 
 void PGTDEnd(void) {
 	std::lock_guard<std::mutex> lock(gMutex);
+	flushFrameRecordsLocked();
 	gActive.store(0, std::memory_order_release);
 	clearSidebandLocked();
 }
@@ -354,6 +581,7 @@ int PGTDClaimPacket(uint32_t op) {
 	std::lock_guard<std::mutex> lock(gMutex);
 	if (!gActive.load(std::memory_order_relaxed)) return 0;
 	ThreadState &thread = threadStateLocked();
+	thread.pendingTagFlags = 0;
 	if (op == kPresentOp) {
 		for (auto &klass : gSelectedKeys) for (auto &key : klass) key.countThisFrame = 0;
 		gFrameClaims = 0;
@@ -379,13 +607,17 @@ int PGTDClaimPacket(uint32_t op) {
 	const bool stageChanged = thread.lastClaimedStageVersion != thread.stageVersion ||
 		thread.lastClaimedStage != thread.context.stage;
 	const bool entityEligible = selectedKeyExtraLocked(thread.context, false);
-	if (!regular && !stageChanged && (!entityEligible ||
-		!selectedKeyExtraLocked(thread.context, true))) return 0;
+	bool selectedExtra = false;
+	if (!regular && !stageChanged) {
+		if (!entityEligible || !selectedKeyExtraLocked(thread.context, true)) return 0;
+		selectedExtra = true;
+	}
 	if (gReport.stats.claimed >= PGTD_TAG_BUDGET) {
 		++gReport.stats.overflow;
 		return 0;
 	}
 	++gReport.stats.claimed;
+	if (selectedExtra) thread.pendingTagFlags |= PGTD_TAG_FLAG_SELECTED_SAMPLE;
 	thread.lastClaimedStageVersion = thread.stageVersion;
 	thread.lastClaimedStage = thread.context.stage;
 	return 1;
@@ -401,7 +633,9 @@ void PGTDProducerPacket(uint64_t packetAddress, uint32_t op, uint32_t words,
 	const uint32_t slotIndex = packetSlot(gReport.session, packetAddress);
 	PacketEntry &slot = gPackets[slotIndex];
 	if (slot.used) ++gReport.stats.collisions;
-	const PGTDTag tag = makeTagLocked(thread, camera);
+	PGTDTag tag = makeTagLocked(thread, camera);
+	if (op == kDrawOp) tag.flags |= thread.pendingTagFlags;
+	thread.pendingTagFlags = 0;
 	slot.session = gReport.session;
 	slot.address = packetAddress;
 	slot.op = op;
@@ -437,16 +671,21 @@ uint32_t PGTDToken(uint32_t domain, uint64_t raw) {
 	if (raw == 0 || !gActive.load(std::memory_order_acquire)) return 0;
 	std::lock_guard<std::mutex> lock(gMutex);
 	if (!gActive.load(std::memory_order_relaxed)) return 0;
-	return tokenLocked(domain, raw);
+	return domain == 6u ? candidateTokenLocked(domain, raw) : tokenLocked(domain, raw);
 }
 
 void PGTDForgetToken(uint32_t domain, uint64_t raw) {
 	if (raw == 0 || !gActive.load(std::memory_order_acquire)) return;
 	std::lock_guard<std::mutex> lock(gMutex);
 	if (!gActive.load(std::memory_order_relaxed)) return;
-	const uint32_t start = tokenSlot(domain, raw);
-	for (uint32_t n = 0; n < PGTD_TOKEN_CAPACITY; ++n) {
-		TokenEntry &entry = gTokens[(start + n) % PGTD_TOKEN_CAPACITY];
+	const bool candidate = domain == 6u;
+	const uint32_t capacity = candidate ? PGTD_CANDIDATE_TOKEN_CAPACITY : PGTD_TOKEN_CAPACITY;
+	const uint32_t start = candidate
+		? static_cast<uint32_t>(mix64(raw ^ (static_cast<uint64_t>(domain) * kHashSalt)) % capacity)
+		: tokenSlot(domain, raw);
+	TokenEntry *table = candidate ? gCandidateTokens : gTokens;
+	for (uint32_t n = 0; n < capacity; ++n) {
+		TokenEntry &entry = table[(start + n) % capacity];
 		if (entry.used && entry.domain == domain && entry.raw == raw) {
 			entry.used = false;
 			entry.tombstone = true;
@@ -464,20 +703,16 @@ void PGTDRecordMetal(const PGTDMetalSample *sample) {
 		++gReport.stats.invalidRecord;
 		return;
 	}
-	if (gReport.recordCount >= PGTD_MAX_RECORDS) {
-		++gReport.stats.recordOverflow;
-		++gReport.stats.truncatedRecords;
-		return;
-	}
 	PGTDMetalSample copy = *sample;
 	copy.frame = gReport.frameCount == UINT32_MAX ? UINT32_MAX : gReport.frameCount + 1;
-	gReport.samples[gReport.recordCount++] = copy;
+	stageRecordLocked(copy);
 }
 
 uint32_t PGTDNextFrame(void) {
 	if (!gActive.load(std::memory_order_acquire)) return 0;
 	std::lock_guard<std::mutex> lock(gMutex);
 	if (!gActive.load(std::memory_order_relaxed)) return 0;
+	flushFrameRecordsLocked();
 	if (gReport.frameCount != UINT32_MAX) ++gReport.frameCount;
 	return gReport.frameCount;
 }

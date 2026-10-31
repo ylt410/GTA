@@ -1,6 +1,7 @@
 #import <Foundation/Foundation.h>
 #include "NativeGraphics.h"
 #include "NativeTemporalDiagnosticsPlatform.h"
+#include "NativeTemporalCameraProbe.h"
 #include <atomic>
 #include <cmath>
 #include <cstring>
@@ -12,7 +13,9 @@
 namespace {
 std::mutex control;
 std::atomic<int> status{0};
+std::atomic<bool> activeCameraProbe{false};
 uint64_t requestGeneration = 0;
+uint64_t activeSession = 0;
 std::once_flag initialized;
 std::string reportPath;
 struct ShaderLabel { uint32_t token; char hash[33], label[97]; };
@@ -28,6 +31,14 @@ void initialize() {
     });
 }
 NSString *hex(uint64_t value) { return [NSString stringWithFormat:@"%016llx", (unsigned long long)value]; }
+NSString *validatedBuildCommit() {
+    id value = [NSBundle.mainBundle objectForInfoDictionaryKey:@"PGDiagnosticBuildSHA"];
+    if (![value isKindOfClass:NSString.class]) return @"unknown";
+    NSString *candidate = [(NSString *)value lowercaseString];
+    if (candidate.length != 40) return @"unknown";
+    NSCharacterSet *nonHex = [[NSCharacterSet characterSetWithCharactersInString:@"0123456789abcdef"] invertedSet];
+    return [candidate rangeOfCharacterFromSet:nonHex].location == NSNotFound ? candidate : @"unknown";
+}
 id finiteNumber(float value) { return std::isfinite(value) ? (id)@(value) : (id)[NSNull null]; }
 NSArray *floats(const float *values, size_t count) {
     NSMutableArray *result = [NSMutableArray arrayWithCapacity:count];
@@ -71,7 +82,10 @@ NSDictionary *sampleJSON(const PGTDMetalSample &s) {
 }
 void finishLocked() {
     if (status.load() != 2) return;
+    const uint64_t session = activeSession;
+    const bool probeRequested = PGTDProbeRequested();
     PGTDEnd();
+    PGTDProbeEnd(session);
     auto report = std::shared_ptr<PGTDReport>(new (std::nothrow) PGTDReport);
     if (!report || !PGTDCopyReport(report.get())) { status.store(5); return; }
     status.store(3);
@@ -82,18 +96,42 @@ void finishLocked() {
             @"label": [NSString stringWithUTF8String:labels[i].label] ?: @""}];
     }
     const uint64_t lostLabels = labelOverflow;
+    NSString *buildCommit = validatedBuildCommit();
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
         @autoreleasepool {
+            NSDictionary *probeSummary = PGTDProbeCopySummary(session);
+            if (![probeSummary isKindOfClass:NSDictionary.class]) {
+                probeSummary = @{
+                    @"requested": @(probeRequested),
+                    @"mode": probeRequested ? @"camera-only-depth-probe" : @"off",
+                    @"session": hex(session),
+                    @"grid": @[@64, @36], @"maximumDispatches": @12,
+                    @"sourceFrames": @0, @"candidates": @0, @"cameraVerifiedFrames": @0,
+                    @"boundaryFrames": @0, @"scheduled": @0, @"completed": @0,
+                    @"gpuFailures": @0, @"busySkips": @0,
+                    @"historyResets": @0, @"pending": @0, @"partialFrame": @NO,
+                    @"timedOut": @NO,
+                    @"rejections": probeRequested ? @{@"summary-unavailable": @1} : @{}, @"frames": @[],
+                    @"readyForTemporal": @NO,
+                    @"limitations": @"Probe summary unavailable; no motion vectors are produced.",
+                    @"contractRejects": @(probeRequested ? 1 : 0)
+                };
+            }
             NSMutableArray *records = [NSMutableArray arrayWithCapacity:report->recordCount];
             for (uint32_t i = 0; i < report->recordCount; ++i) [records addObject:sampleJSON(report->samples[i])];
             const auto &c = report->stats;
             NSMutableDictionary *root = [@{
-                @"schema": @1, @"purpose": @"Temporal input diagnostics ONLY; reconstruction is not enabled",
+                @"schema": @2, @"cameraLayoutVersion": @2,
+                @"purpose": @"Temporal input diagnostics ONLY; reconstruction is not enabled",
                 @"engineSHA256": @"11ca8d2c04c5e843d18ff4aea4899d72c86973c6b031df334e67c446b2ae83e0",
                 @"baseCommit": @"704e526cd1ab8c265371f3fa4995371c8b1e853d",
+                @"baseCommitRole": @"baseline source revision; buildCommit identifies this app build",
+                @"buildCommit": buildCommit,
                 @"session": hex(report->session), @"sourcePresentCount": @(report->frameCount),
                 @"privacy": @"No account, paths, URLs, screenshots, audio, raw pointers or OS thread IDs. Camera numbers describe game space.",
-                @"limitations": @"Candidate identities are not generation-safe; sampled/unknown/overflow paths are not proof of absence. No performance measurements.",
+                @"limitations": @"Candidate identities are not generation-safe; camera-only reprojection is not actor motion; ambiguous resources may be skipped. Sampled/unknown/overflow paths are not proof of absence. No performance measurements.",
+                @"tokenSemantics": @"Opaque anonymous token values, unique and not reused within one session; they do not identify objects across sessions. Transient raw-to-token mappings can be evicted, so one resource may later receive another token and continuity can split. CandidateEntityToken is not generation-safe. Token 0 means unavailable or overflow.",
+                @"cameraProbe": probeSummary,
                 @"uniformSlots": @[@1, @2, @3, @0], @"uniformHashByteLimit": @4096,
                 @"stats": @{@"claimed": @(c.claimed), @"published": @(c.published), @"matched": @(c.matched),
                     @"misses": @(c.misses), @"collisions": @(c.collisions), @"overflow": @(c.overflow),
@@ -101,6 +139,12 @@ void finishLocked() {
                     @"tokenOverflow": @(c.tokenOverflow), @"truncatedRecords": @(c.truncatedRecords),
                     @"recordOverflow": @(c.recordOverflow),
                     @"invalidRecord": @(c.invalidRecord), @"threadOverflow": @(c.threadOverflow),
+                    @"quotaDroppedRecords": @(c.quotaDroppedRecords),
+                    @"transientTokenEvictions": @(c.transientTokenEvictions),
+                    @"resourceTokenOverflow": @(c.resourceTokenOverflow),
+                    @"candidateTokenOverflow": @(c.candidateTokenOverflow),
+                    @"transientTokenOverflow": @(c.transientTokenOverflow),
+                    @"downsampledFrames": @(c.downsampledFrames),
                     @"shaderManifestOverflow": @(lostLabels)},
                 @"shaderManifest": shaderManifest, @"records": records
             } mutableCopy];
@@ -124,17 +168,19 @@ void finishLocked() {
 
 extern "C" int PGTemporalDiagnosticsStatus(void) { initialize(); return status.load(); }
 extern "C" const char *PGTemporalDiagnosticsReportPath(void) { initialize(); return reportPath.c_str(); }
-extern "C" void PGTemporalDiagnosticsStart(void) {
+static void startCapture(bool cameraProbe) {
     initialize();
     std::lock_guard<std::mutex> guard(control);
     if (status.load() == 1 || status.load() == 2 || status.load() == 3) return;
     const uint64_t request = ++requestGeneration;
+    activeCameraProbe.store(cameraProbe);
     status.store(1);
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
         std::lock_guard<std::mutex> lock(control);
         if (request != requestGeneration || status.load() != 1) return;
         labelCount = 0; labelOverflow = 0;
-        PGTDBegin();
+        activeSession = PGTDBegin();
+        PGTDProbeBegin(activeSession, cameraProbe);
         status.store(2);
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 15 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
             std::lock_guard<std::mutex> timerLock(control);
@@ -142,6 +188,9 @@ extern "C" void PGTemporalDiagnosticsStart(void) {
         });
     });
 }
+extern "C" void PGTemporalDiagnosticsStart(void) { startCapture(false); }
+extern "C" void PGTemporalDiagnosticsStartCameraProbe(void) { startCapture(true); }
+extern "C" int PGTemporalDiagnosticsIsCameraProbe(void) { return activeCameraProbe.load() ? 1 : 0; }
 extern "C" void PGTemporalDiagnosticsStop(void) {
     initialize();
     std::lock_guard<std::mutex> guard(control);

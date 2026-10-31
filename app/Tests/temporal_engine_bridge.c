@@ -27,9 +27,9 @@ static int mutate_after_view_copy;
 static void *pgtd_test_memcpy(void *destination, const void *source, size_t length) {
   void *result = memcpy(destination, source, length);
   if (mutate_after_view_copy && tracked_guest_data &&
-      source == tracked_guest_data + tracked_viewport + 192u && length == 16u * sizeof(float)) {
+      source == tracked_guest_data + tracked_viewport + 256u && length == 16u * sizeof(float)) {
     float changed = 2.0f;
-    memcpy(tracked_guest_data + tracked_viewport + 192u, &changed, sizeof changed);
+    memcpy(tracked_guest_data + tracked_viewport + 256u, &changed, sizeof changed);
     mutate_after_view_copy = 0;
   }
   return result;
@@ -69,12 +69,16 @@ static void set_camera(uint8_t *data, uint64_t size, uint64_t viewport) {
   assert(global + 8 <= size);
   put(data, global, &viewport, sizeof viewport);
   if (!viewport || viewport > size - 876) return;
-  float view[16] = {0}, projection[16] = {0};
+  float cameraToWorld[16] = {0}, view[16] = {0}, projection[16] = {0};
+  cameraToWorld[0] = cameraToWorld[5] = cameraToWorld[10] = cameraToWorld[15] = 1.0f;
+  cameraToWorld[12] = 91.0f; cameraToWorld[13] = -37.0f;
   view[0] = view[5] = view[10] = view[15] = 1.0f;
+  view[12] = 0.125f; view[13] = -0.25f; view[14] = 0.5f;
   projection[0] = projection[5] = projection[10] = projection[15] = 1.0f;
   uint32_t width = 1280, height = 720;
   float nearPlane = 0.1f, farPlane = 1000.0f;
-  put(data, viewport + 192, view, sizeof view);
+  put(data, viewport + 192, cameraToWorld, sizeof cameraToWorld);
+  put(data, viewport + 256, view, sizeof view);
   put(data, viewport + 320, projection, sizeof projection);
   put(data, viewport + 864, &width, sizeof width);
   put(data, viewport + 868, &height, sizeof height);
@@ -116,6 +120,10 @@ int main(void) {
   pg_td_packet(&instance, 256);
   assert(producer_calls == 1 && last_tag.camera.valid == 1);
   assert(last_tag.camera.width == 1280 && last_tag.camera.height == 720);
+  // +192 is deliberately a distinct camera-to-world matrix; diagnostics must
+  // capture the engine's inverse view at +256, not silently reuse +192.
+  assert(last_tag.camera.view[12] == 0.125f);
+  assert(last_tag.camera.view[13] == -0.25f && last_tag.camera.view[14] == 0.5f);
 
   // A bad viewport address is non-trapping and remains explicitly invalid.
   set_camera(data, bytes, bytes - 64);
@@ -125,7 +133,7 @@ int main(void) {
   // Non-finite matrix contents and unreasonable dimensions cannot be reported as valid.
   set_camera(data, bytes, 4096);
   float nan_value = NAN;
-  put(data, 4096 + 192, &nan_value, sizeof nan_value);
+  put(data, 4096 + 256, &nan_value, sizeof nan_value);
   pg_td_packet(&instance, 256);
   assert(last_tag.camera.valid == 0);
   set_camera(data, bytes, 4096);

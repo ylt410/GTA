@@ -120,6 +120,7 @@ targets:
           NSAllowsArbitraryLoads: true
         # Filled in by the cloud build so you don't have to type it.
         PGDefaultAssetServer: ""
+        PGDiagnosticBuildSHA: "unknown"
         # The Lite build for iPhones with little memory (build_ipa.sh --lite).
         PGLiteMode: false
         # The app folder (logs) is visible in the Files app.

@@ -25,6 +25,7 @@
 #include "BC1ToASTC.h"
 #include "NativeGraphics.h"
 #include "NativeTemporalDiagnosticsPlatform.h"
+#include "NativeTemporalCameraProbe.h"
 #include "NativeFrameRate.h"
 #import <UIKit/UIKit.h>
 #if __has_include(<MetalFX/MetalFX.h>) && !TARGET_OS_SIMULATOR		// iPhone SDK only
@@ -2808,6 +2809,37 @@ static void temporalDiagnosticSample(const PGTDTag &tag, uint32_t op, const uint
 			if (valid) s.flags |= 2u; else memset(s.wvp, 0, sizeof s.wvp);
 		}
 	}
+	if (PGTDProbeRequested()) {
+		PGTDProbeDrawState probe{};
+		Texture *depth = texture(R->ds.tex);
+		probe.depth = depth ? depth->tex : nil;
+		if (State *dss = state(R->dssId)) if (dss->words.size() >= 13 && dss->words[0]) {
+			probe.depthWrite = dss->words[1] == 1 && !R->passInfo.roDepth;
+			if (dss->words[2] >= 1 && dss->words[2] <= 8) probe.depthCompare = dss->words[2] - 1;
+		}
+		probe.fullViewport = R->hasViewport && R->viewport[0] == 0 && R->viewport[1] == 0 &&
+			R->viewport[2] == tag.camera.width && R->viewport[3] == tag.camera.height &&
+			R->viewport[4] == 0 && R->viewport[5] == 1;
+		// Pinned WGSL verified these exact shader variants' world rows and WVP.
+		// Static tire and arbitrary similarly named variants are NOT assumed equal.
+		const bool verifiedLayout = vs && (vs->hash == "6a6a0898a51cf403" ||
+			vs->hash == "134025f0da917112" || vs->hash == "2411632420e981ff" ||
+			vs->hash == "f524dc3c430c8361");
+		if (op == DRAW && verifiedLayout && s.uniformBytes[0] >= 192) {
+			const auto &binding = R->cb[0][1];
+			Buffer *b = buffer(binding.buf);
+			const size_t offset = (size_t)binding.first * 16;
+			if (b && offset <= b->shadow.size() && b->shadow.size() - offset >= 192) {
+				float rows[16]; memcpy(rows, b->shadow.data() + offset, sizeof rows);
+				for (unsigned row = 0; row < 4; ++row) {
+					for (unsigned col = 0; col < 3; ++col) probe.worldRows[row * 4 + col] = rows[row * 4 + col];
+					probe.worldRows[row * 4 + 3] = row == 3 ? 1.f : 0.f;
+				}
+				probe.worldKnown = true;
+			}
+		}
+		PGTDProbeObserveSample(s, probe);
+	}
 	PGTDRecordMetal(&s);
 }
 
@@ -2852,9 +2884,22 @@ static void loop() {
 				    op == CREATE_SHADER || op == CREATE_LAYOUT || op == CREATE_STATE || op == CREATE_SRV || op == CREATE_UAV || op == CREATE_QUERY))
 					PGTDForgetToken(100, base[2]);
 				const uint64_t drawsBefore = sampled ? R->draws : 0;
+					if (PGTDProbeRequested()) {
+						if (n && (op == CLEAR_DS || op == DESTROY_OBJECT || op == CREATE_TEXTURE))
+							if (Texture *t = texture(base[2])) PGTDProbeInvalidateDepth(t->tex);
+						if (sampled && PGTDProbeNeedsBoundary(diagnosticTag, op)) {
+							// Stage105 marks entry to UI binding, not completed UI color.
+							// Store the previous scene pass and probe its retained depth.
+							endEncoders();
+							PGTDProbeEncodeBoundary(commandBuffer(), diagnosticTag);
+						}
+					}
 				execute(op, base + 2, n);
 				if (sampled) temporalDiagnosticSample(diagnosticTag, op, base + 2, n, drawsBefore);
-				if (op == PRESENT) PGTDPlatformFrame(); // counts source PRESENTs, not display refreshes
+					if (op == PRESENT) {
+						PGTDProbeSourcePresent();
+						PGTDPlatformFrame(); // source PRESENTs, not display refreshes
+					}
 				tail += n * 4 + 8;
 				executed++;
 				if (++sinceYield >= 512) {

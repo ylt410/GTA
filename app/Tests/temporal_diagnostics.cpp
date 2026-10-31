@@ -51,6 +51,7 @@ static void testDisabledAndSessionIsolation() {
 	assert(PGTDBegin() != 0);
 	assert(PGTDEnabled());
 	assert(PGTDToken(9, 0xabcdef) != 0);
+	const uint32_t firstSessionToken = PGTDToken(100, 0x5555);
 	const uint64_t oldCookie = PGTDScopeEnter(100, 0, 0, 0, 0);
 	assert(oldCookie != 0);
 	const auto cam = cameraFor(1);
@@ -63,6 +64,7 @@ static void testDisabledAndSessionIsolation() {
 	assert(report.session != 0 && report.stats.published == 1);
 	const uint64_t newSession = PGTDBegin();
 	assert(newSession != report.session);
+	assert(PGTDToken(100, 0x5555) != firstSessionToken); // Opaque IDs never recycle across sessions.
 	PGTDScopeLeave(oldCookie); // Epoch mismatch must not pop or poison new state.
 	assert(publishConsume(0xfeed, 32, 4, &cam).stage == 0);
 	PGTDEnd();
@@ -73,8 +75,6 @@ static void testDisabledAndSessionIsolation() {
 static void testNestedScopesAndFailClosed() {
 	PGTDBegin();
 	constexpr uint64_t rawCandidate = UINT64_C(0x112233440000002a);
-	const uint32_t rootMatrixToken = PGTDToken(4, 0x3333);
-	const uint32_t paletteCandidateToken = PGTDToken(3, 0x4444);
 	const uint64_t stage = PGTDScopeEnter(100, 0, 0, 0, 0);
 	const uint64_t entity = PGTDScopeEnter(1, 0x1111, 0x2222, rawCandidate, PGTD_SCOPE_FLAG_KEY_VALID);
 	const uint64_t palette = PGTDScopeEnter(200, 0x3333, 0x4444, 0, 0);
@@ -84,10 +84,15 @@ static void testNestedScopesAndFailClosed() {
 	const uint32_t outerCandidateToken = tag.entityKey;
 	assert((tag.flags & PGTD_TAG_FLAG_KEY_VALID) != 0);
 	assert(tag.entityToken != 0 && tag.auxiliaryToken != 0 && tag.paletteToken != 0);
-	assert(tag.rootMatrixToken == rootMatrixToken && tag.paletteToken == paletteCandidateToken);
-	assert(tag.rootMatrixToken != tag.paletteToken);
+	const uint32_t rootMatrixToken = tag.rootMatrixToken;
+	const uint32_t paletteCandidateToken = tag.paletteToken;
+	const uint32_t auxiliaryToken = tag.auxiliaryToken;
+	assert(rootMatrixToken != 0 && rootMatrixToken != paletteCandidateToken);
 	assert(tag.rootMatrixToken != 0x3333 && tag.paletteToken != 0x4444);
-	assert(tag.auxiliaryToken == PGTDToken(2, 0x2222)); // Palette scope leaves entity context intact.
+	assert(tag.auxiliaryToken != 0x2222); // Palette scope leaves entity context intact.
+	tag = publishConsume(110, 32, 5);
+	assert(tag.rootMatrixToken == rootMatrixToken && tag.paletteToken == paletteCandidateToken);
+	assert(tag.auxiliaryToken == auxiliaryToken && tag.entityKey == outerCandidateToken);
 	const uint32_t outerRootToken = tag.rootMatrixToken;
 	const uint32_t outerPaletteToken = tag.paletteToken;
 
@@ -249,6 +254,49 @@ static void testWrongHeaderCollisionAndAnonymization() {
 	assert(report.stats.collisions >= 1 && report.stats.misses >= 2);
 }
 
+static void testTokenPoolSeparationAndTransientEviction() {
+	constexpr uint32_t domain = 1;
+	uint64_t colliding[5]{};
+	uint32_t set = UINT32_MAX;
+	uint32_t found = 0;
+	for (uint64_t raw = 1; found < 5; ++raw) {
+		const uint32_t candidateSet = static_cast<uint32_t>(testMix64(raw ^
+			(static_cast<uint64_t>(domain) * UINT64_C(0x9e3779b97f4a7c15))) %
+			(PGTD_TRANSIENT_TOKEN_CAPACITY / 4));
+		if (set == UINT32_MAX) set = candidateSet;
+		if (candidateSet == set) colliding[found++] = raw;
+	}
+	PGTDBegin();
+	const uint32_t resource = PGTDToken(100, 0xfeedface);
+	const uint32_t candidate = PGTDToken(6, 0x1234567800000042ull);
+	uint32_t transientFirst = 0;
+	for (uint32_t i = 0; i < 5; ++i) {
+		const uint64_t scope = PGTDScopeEnter(1, colliding[i], 0, 0, 0);
+		const PGTDTag tag = publishConsume(0x8000 + i);
+		if (i == 0) transientFirst = tag.entityToken;
+		PGTDScopeLeave(scope);
+	}
+	const uint64_t revisit = PGTDScopeEnter(1, colliding[0], 0, 0, 0);
+	const PGTDTag revisited = publishConsume(0x8100);
+	PGTDScopeLeave(revisit);
+	assert(transientFirst != 0 && revisited.entityToken != 0 && revisited.entityToken != transientFirst);
+	assert(PGTDToken(100, 0xfeedface) == resource);
+	assert(PGTDToken(6, 0x1234567800000042ull) == candidate);
+	PGTDEnd();
+	static PGTDReport report;
+	assert(PGTDCopyReport(&report));
+	assert(report.stats.transientTokenEvictions >= 2);
+	assert(report.stats.resourceTokenOverflow == 0 && report.stats.candidateTokenOverflow == 0);
+
+	PGTDBegin();
+	for (uint32_t i = 0; i < PGTD_TOKEN_CAPACITY / 2; ++i)
+		assert(PGTDToken(100, UINT64_C(0x100000000) + i) != 0);
+	assert(PGTDToken(100, 0xfeedface) != 0);
+	PGTDEnd();
+	assert(PGTDCopyReport(&report));
+	assert(report.stats.resourceTokenOverflow == 0 && report.stats.tokenOverflow == 0);
+}
+
 static void testTokenTombstoneProbeChain() {
 	constexpr uint32_t domain = 77;
 	uint64_t raw[3]{};
@@ -341,10 +389,12 @@ static void testSamplingAndRecordBounds() {
 	assert(PGTDNextFrame() == 1);
 	PGTDEnd();
 	assert(PGTDCopyReport(&report));
-	assert(report.recordCount == PGTD_MAX_RECORDS);
+	assert(report.recordCount == PGTD_RECORDS_PER_FRAME);
 	assert(report.frameCount == 1);
 	assert(report.samples[0].frame == 1);
-	assert(report.stats.recordOverflow == 12 && report.stats.truncatedRecords == 12);
+	assert(report.stats.recordOverflow == 0 && report.stats.truncatedRecords == 0);
+	assert(report.stats.quotaDroppedRecords >= PGTD_MAX_RECORDS + 12 - PGTD_RECORDS_PER_FRAME);
+	assert(report.stats.downsampledFrames == 1);
 
 	PGTDBegin();
 	for (uint32_t i = 0; i < PGTD_TAG_BUDGET - 1; ++i) {
@@ -361,6 +411,163 @@ static void testSamplingAndRecordBounds() {
 	assert(PGTDCopyReport(&report));
 	assert(report.stats.claimed == PGTD_TAG_BUDGET + 1);
 	assert(report.stats.overflow == 2);
+}
+
+static void testSelectedPropagationAndFrameQueueIsolation() {
+	PGTDBegin();
+	const uint64_t session = PGTDScopeEnter(1, 0xabc, 0, 0x123400000001ull,
+		PGTD_SCOPE_FLAG_KEY_VALID);
+	assert(PGTDClaimPacket(32)); // first regular draw
+	PGTDProducerPacket(0x9101, 32, 3, nullptr);
+	PGTDTag ordinary{};
+	assert(PGTDConsumePacket(0x9101, 32, 3, &ordinary));
+	assert((ordinary.flags & PGTD_TAG_FLAG_SELECTED_SAMPLE) == 0);
+	assert(PGTDClaimPacket(32)); // selected-key continuity extra
+	PGTDProducerPacket(0x9102, 32, 3, nullptr);
+	PGTDTag selected{};
+	assert(PGTDConsumePacket(0x9102, 32, 3, &selected));
+	assert((selected.flags & PGTD_TAG_FLAG_SELECTED_SAMPLE) != 0);
+	PGTDMetalSample sample{};
+	sample.tag = selected;
+	sample.opcode = 32;
+	PGTDRecordMetal(&sample);
+	PGTDScopeLeave(session);
+
+	PGTDProducerPacket(0xa001, 32, 4, nullptr); // producer can be ahead of consumer frame boundary
+	assert(PGTDNextFrame() == 1);
+	PGTDTag future{};
+	assert(PGTDConsumePacket(0xa001, 32, 4, &future)); // NextFrame must not clear sideband
+	assert(future.session != 0 && future.session == selected.session);
+	PGTDEnd();
+	static PGTDReport report;
+	assert(PGTDCopyReport(&report));
+	assert(report.recordCount == 1 && report.samples[0].tag.entityKey == selected.entityKey);
+}
+
+static void testSixtyFrameBoundedCollection() {
+	const uint64_t session = PGTDBegin();
+	static PGTDReport report;
+	uint64_t sequence = 1;
+	for (uint32_t frame = 1; frame <= 60; ++frame) {
+		PGTDMetalSample sample{};
+		sample.tag.session = session;
+		sample.frame = 0xfffffff0u; // RecordMetal owns frame assignment.
+		sample.tag.sequence = sequence++;
+		sample.opcode = 7;
+		PGTDRecordMetal(&sample);
+		for (uint32_t stage = 100; stage <= 109; ++stage) {
+			sample = {};
+			sample.tag.session = session;
+			sample.tag.sequence = sequence++;
+			sample.tag.stage = stage;
+			sample.opcode = 26;
+			PGTDRecordMetal(&sample);
+		}
+		for (uint32_t stage = 100; stage <= 109; ++stage) {
+			sample = {};
+			sample.tag.session = session;
+			sample.tag.sequence = sequence++;
+			sample.tag.stage = stage;
+			sample.opcode = 32;
+			PGTDRecordMetal(&sample);
+		}
+		for (uint32_t key = 1; key <= 4; ++key) {
+			for (uint32_t repeat = 0; repeat < 2; ++repeat) {
+				sample = {};
+				sample.tag.session = session;
+				sample.tag.sequence = sequence++;
+				sample.tag.entityKey = PGTDToken(6, 0x90000000ull + key);
+				sample.tag.flags = PGTD_TAG_FLAG_SELECTED_SAMPLE;
+				sample.opcode = 32;
+				PGTDRecordMetal(&sample);
+			}
+		}
+		for (uint32_t draw = 0; draw < 16; ++draw) {
+			sample = {};
+			sample.tag.session = session;
+			sample.tag.sequence = sequence++;
+			sample.opcode = 32;
+			PGTDRecordMetal(&sample);
+		}
+		assert(PGTDNextFrame() == frame);
+	}
+	PGTDEnd();
+	assert(PGTDCopyReport(&report));
+	assert(report.frameCount == 60 && report.recordCount == 60 * PGTD_RECORDS_PER_FRAME);
+	assert(report.recordCount < PGTD_MAX_RECORDS);
+	assert(report.stats.recordOverflow == 0 && report.stats.truncatedRecords == 0);
+	assert(report.stats.downsampledFrames == 60);
+	assert(report.stats.quotaDroppedRecords == 60 * 13);
+	for (uint32_t frame = 1; frame <= 60; ++frame) {
+		uint32_t count = 0;
+		bool hasPresent = false;
+		bool hasStage105Boundary = false;
+		for (uint32_t i = 0; i < report.recordCount; ++i) {
+			const PGTDMetalSample &item = report.samples[i];
+			if (item.frame != frame) continue;
+			++count;
+			if (item.opcode == 7) hasPresent = true;
+			if (item.opcode == 26 && item.tag.stage == 105) hasStage105Boundary = true;
+		}
+		assert(count == PGTD_RECORDS_PER_FRAME && hasPresent && hasStage105Boundary);
+	}
+	for (uint32_t i = 0; i < report.recordCount; ++i)
+		assert(report.samples[i].frame >= 1 && report.samples[i].frame <= 60);
+	for (uint32_t i = 1; i < report.recordCount; ++i) {
+		assert(report.samples[i - 1].frame <= report.samples[i].frame);
+		assert(report.samples[i - 1].tag.sequence < report.samples[i].tag.sequence);
+	}
+
+	const uint64_t overflowSession = PGTDBegin();
+	for (uint32_t frame = 1; frame <= 65; ++frame) {
+		for (uint32_t draw = 0; draw < PGTD_RECORDS_PER_FRAME; ++draw) {
+			PGTDMetalSample sample{};
+			sample.tag.session = overflowSession;
+			sample.tag.sequence = frame * 100u + draw;
+			sample.opcode = 32;
+			PGTDRecordMetal(&sample);
+		}
+		assert(PGTDNextFrame() == frame);
+	}
+	PGTDEnd();
+	assert(PGTDCopyReport(&report));
+	assert(report.frameCount == 65 && report.recordCount == PGTD_MAX_RECORDS);
+	assert(report.stats.recordOverflow == PGTD_RECORDS_PER_FRAME);
+	assert(report.stats.truncatedRecords == PGTD_RECORDS_PER_FRAME);
+	assert(report.stats.quotaDroppedRecords == 0 && report.stats.downsampledFrames == 0);
+	for (uint32_t i = 1; i < report.recordCount; ++i) {
+		assert(report.samples[i - 1].frame <= report.samples[i].frame);
+		assert(report.samples[i - 1].tag.sequence < report.samples[i].tag.sequence);
+	}
+}
+
+static void testReportEndFlushChronology() {
+	const uint64_t session = PGTDBegin();
+	PGTDMetalSample sample{};
+	sample.tag.session = session;
+	sample.tag.sequence = 10;
+	sample.opcode = 32;
+	PGTDRecordMetal(&sample);
+	sample = {};
+	sample.tag.session = session;
+	sample.tag.sequence = 30;
+	sample.opcode = 7;
+	PGTDRecordMetal(&sample);
+	sample = {};
+	sample.tag.session = session;
+	sample.tag.sequence = 20;
+	sample.tag.stage = 105;
+	sample.opcode = 26;
+	PGTDRecordMetal(&sample);
+	PGTDEnd();
+	static PGTDReport report;
+	assert(PGTDCopyReport(&report));
+	assert(report.frameCount == 0 && report.recordCount == 3);
+	assert(report.samples[0].tag.sequence == 10);
+	assert(report.samples[1].tag.sequence == 20);
+	assert(report.samples[2].tag.sequence == 30);
+	assert(report.samples[0].frame == 1 && report.samples[1].frame == 1 &&
+		report.samples[2].frame == 1);
 }
 
 static void testCameraValidationAndConcurrency() {
@@ -426,8 +633,12 @@ int main() {
 	testWideCandidateIdentityAndSampling();
 	testThreadInvalidation();
 	testWrongHeaderCollisionAndAnonymization();
+	testTokenPoolSeparationAndTransientEviction();
 	testTokenTombstoneProbeChain();
 	testSamplingAndRecordBounds();
+	testSelectedPropagationAndFrameQueueIsolation();
+	testSixtyFrameBoundedCollection();
+	testReportEndFlushChronology();
 	testCameraValidationAndConcurrency();
-	std::puts("PASS: temporal diagnostic epochs, scopes, packet matching, anonymization, sampling, bounds, camera validation and concurrency.");
+	std::puts("PASS: temporal diagnostic epochs, scopes, packet matching, identity pools, quotas, 60-frame bounds, camera validation and concurrency.");
 }

@@ -25,6 +25,9 @@ void PGSetPresentInterval(double seconds);
 void PGRequestRendererMemoryReclaim(void);
 // Opt-in, bounded input-contract diagnostics. This does NOT enable Temporal.
 void PGTemporalDiagnosticsStart(void);
+// Experimental, opt-in sparse camera/depth probe; does not enable Temporal.
+void PGTemporalDiagnosticsStartCameraProbe(void);
+int PGTemporalDiagnosticsIsCameraProbe(void);
 void PGTemporalDiagnosticsStop(void);
 int PGTemporalDiagnosticsStatus(void); // idle, armed, recording, saving, ready, failed
 const char *PGTemporalDiagnosticsReportPath(void);

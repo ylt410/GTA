@@ -13,6 +13,15 @@ def run(args):
     print('+ ' + ' '.join(map(str, args)), flush=True)
     subprocess.run(list(map(str, args)), cwd=ROOT, check=True)
 
+def run_metal_test(args):
+    print('+ ' + ' '.join(map(str, args)), flush=True)
+    result = subprocess.run(list(map(str, args)), cwd=ROOT, check=False)
+    if result.returncode == 77:
+        print('SKIP: no Metal device; Objective-C++ compilation still ran.', flush=True)
+        return
+    if result.returncode != 0:
+        raise subprocess.CalledProcessError(result.returncode, args)
+
 def main():
     cc = os.environ.get('CC') or shutil.which('cc')
     cxx = os.environ.get('CXX') or shutil.which('c++')
@@ -59,6 +68,10 @@ def main():
         run([cxx, '-std=c++17', '-O2', '-Wall', '-Wextra', '-Werror', '-pthread',
              'Source/NativeTemporalDiagnostics.cpp', 'Tests/temporal_diagnostics.cpp', '-o', temporal])
         run([temporal])
+        reprojection = Path(work) / 'temporal-reprojection'
+        run([cxx, '-std=c++17', '-O2', '-Wall', '-Wextra', '-Werror', '-pthread',
+             'Tests/temporal_reprojection.cpp', '-o', reprojection])
+        run([reprojection])
         bridge = Path(work) / 'temporal-engine-bridge'
         run([cc, '-std=c11', '-O2', '-Wall', '-Wextra', '-Werror', '-I', 'Source',
              'Tests/temporal_engine_bridge.c', '-lm', '-o', bridge])
@@ -103,6 +116,15 @@ def main():
             run(['xcrun', '--sdk', 'iphoneos', 'clang++', '-fsyntax-only', '-std=c++20',
                  '-fobjc-arc', '-fblocks', '-target', 'arm64-apple-ios16.0', '-isysroot', sdk,
                  '-I', 'Source', 'Source/NativeTemporalDiagnosticsPlatform.mm'])
+            run(['xcrun', '--sdk', 'iphoneos', 'clang++', '-fsyntax-only', '-std=c++20',
+                 '-fobjc-arc', '-fblocks', '-target', 'arm64-apple-ios16.0', '-isysroot', sdk,
+                 '-I', 'Source', 'Source/NativeTemporalCameraProbe.mm'])
+            probe_test = Path(work) / 'temporal-camera-probe'
+            run([cxx, '-std=c++20', '-O2', '-Wall', '-Wextra', '-fobjc-arc', '-fblocks', '-pthread',
+                 '-I', 'Source', 'Source/NativeTemporalCameraProbe.mm',
+                 'Tests/temporal_camera_probe.mm', '-framework', 'Foundation', '-framework', 'Metal',
+                 '-o', probe_test])
+            run_metal_test([probe_test])
         else:
             print('Swift/UIKit checks deferred to the same macOS build job.', flush=True)
     print('Performance/cache preflight passed.', flush=True)

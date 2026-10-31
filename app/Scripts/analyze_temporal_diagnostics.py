@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Safely summarize a bounded schema-1 Temporal diagnostics JSON report.
+"""Safely summarize bounded schema-1/2 Temporal diagnostics JSON reports.
 
 This is a local, read-only analysis tool. It does not load executable data, access the
 network, or infer temporal reconstruction validity from renderer metadata.
@@ -20,7 +20,9 @@ MAX_RECORDS = 2048
 MAX_MANIFEST = 256
 MAX_UNKNOWN_FIELDS = 64
 SUBRESOURCE_COMPARISON_OMIT_MASK = 1 << 4
+LEGACY_CAMERA_ENGINE_SHA256 = "11ca8d2c04c5e843d18ff4aea4899d72c86973c6b031df334e67c446b2ae83e0"
 _HEX16 = re.compile(r"^[0-9a-fA-F]{16}$")
+_PROBE_REJECTION_KEY = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,63}$")
 
 STAGE_NAMES = {
     100: "HUD render",
@@ -45,6 +47,23 @@ STAT_FIELDS = {
     "claimed", "published", "matched", "misses", "collisions", "overflow",
     "invalidCamera", "scopeErrors", "tokenOverflow", "truncatedRecords",
     "recordOverflow", "invalidRecord", "threadOverflow", "shaderManifestOverflow",
+}
+SCHEMA2_STAT_FIELDS = {
+    "quotaDroppedRecords", "transientTokenEvictions", "resourceTokenOverflow",
+    "candidateTokenOverflow", "transientTokenOverflow", "downsampledFrames",
+}
+CAMERA_PROBE_FIELDS = {
+    "requested", "mode", "session", "grid", "maximumDispatches", "sourceFrames",
+    "candidates", "cameraVerifiedFrames", "boundaryFrames", "scheduled", "completed",
+    "gpuFailures", "busySkips", "contractRejects", "historyResets", "pending",
+    "partialFrame", "timedOut", "readyForTemporal", "limitations", "rejections", "frames",
+}
+CAMERA_PROBE_FRAME_FIELDS = {
+    "frame", "width", "height", "depthToken", "depthFormat", "sceneColorToken",
+    "uiColorToken", "cameraVPResidual", "status", "validDepthSamples",
+    "backgroundSamples", "invalidDepthSamples", "validMotionSamples",
+    "cpuGpuComparedSamples", "cpuGpuMismatchSamples", "maxErrorPixels",
+    "meanMotionPixels", "maxMotionPixels", "hudAfterBoundary",
 }
 RECORD_FIELDS = {
     "frame", "opcode", "sequence", "thread", "stage", "entityClass",
@@ -102,6 +121,12 @@ def _uint(value: Any, where: str, maximum: int = 0xFFFFFFFF) -> int:
     return value
 
 
+def _bool(value: Any, where: str) -> bool:
+    if type(value) is not bool:
+        raise ReportError(f"{where} must be a boolean")
+    return value
+
+
 def _number_or_null(value: Any, where: str) -> float | None:
     if value is None:
         return None
@@ -128,6 +153,132 @@ def _u32_array(value: Any, length: int, where: str) -> list[int]:
 
 def _float_array(value: Any, length: int, where: str) -> list[float | None]:
     return [_number_or_null(item, f"{where}[{index}]") for index, item in enumerate(_array(value, length, where))]
+
+
+def _finite_number(value: Any, where: str) -> float:
+    number = _number_or_null(value, where)
+    if number is None:
+        raise ReportError(f"{where} must be a finite number")
+    return number
+
+
+def _validate_camera_probe(value: Any, root_session: str, unknown: list[str]) -> dict[str, Any]:
+    probe = _object(value, "cameraProbe")
+    _required(probe, CAMERA_PROBE_FIELDS, "cameraProbe")
+    _unknown(probe, CAMERA_PROBE_FIELDS, "cameraProbe", unknown)
+    requested = _bool(probe["requested"], "cameraProbe.requested")
+    mode = _string(probe["mode"], "cameraProbe.mode", 64)
+    if mode not in ("off", "camera-only-depth-probe"):
+        raise ReportError("cameraProbe.mode must be off or camera-only-depth-probe")
+    probe_session = _string(probe["session"], "cameraProbe.session", 16)
+    if not _HEX16.fullmatch(probe_session) or probe_session != root_session:
+        raise ReportError("cameraProbe.session must match the root session")
+    grid = _u32_array(probe["grid"], 2, "cameraProbe.grid")
+    if grid != [64, 36]:
+        raise ReportError("cameraProbe.grid must be [64, 36]")
+    maximum_dispatches = _uint(probe["maximumDispatches"], "cameraProbe.maximumDispatches")
+    if maximum_dispatches != 12:
+        raise ReportError("cameraProbe.maximumDispatches must be 12")
+
+    counter_names = (
+        "sourceFrames", "candidates", "cameraVerifiedFrames", "boundaryFrames", "scheduled",
+        "completed", "gpuFailures", "busySkips", "contractRejects", "historyResets", "pending",
+    )
+    counters = {name: _uint(probe[name], f"cameraProbe.{name}", maximum=0xFFFFFFFFFFFFFFFF)
+                for name in counter_names}
+    if counters["scheduled"] > maximum_dispatches:
+        raise ReportError("cameraProbe.scheduled exceeds maximumDispatches")
+    partial_frame = _bool(probe["partialFrame"], "cameraProbe.partialFrame")
+    if counters["cameraVerifiedFrames"] > counters["sourceFrames"]:
+        raise ReportError("cameraProbe.cameraVerifiedFrames exceeds sourceFrames")
+    if counters["boundaryFrames"] > counters["sourceFrames"] + (1 if partial_frame else 0):
+        raise ReportError("cameraProbe.boundaryFrames exceeds sourceFrames plus partialFrame")
+    timed_out = _bool(probe["timedOut"], "cameraProbe.timedOut")
+    ready = _bool(probe["readyForTemporal"], "cameraProbe.readyForTemporal")
+    if ready:
+        raise ReportError("cameraProbe.readyForTemporal must be false")
+    limitations = _string(probe["limitations"], "cameraProbe.limitations", 2048)
+
+    rejections = _object(probe["rejections"], "cameraProbe.rejections")
+    if len(rejections) > 64:
+        raise ReportError("cameraProbe.rejections may contain at most 64 entries")
+    rejection_counts: dict[str, int] = {}
+    for name, count in rejections.items():
+        _string(name, "cameraProbe.rejections key", 64)
+        if not _PROBE_REJECTION_KEY.fullmatch(name) or re.fullmatch(r"(?:0x)?[0-9a-fA-F]{8,16}", name):
+            raise ReportError("cameraProbe.rejections keys must be bounded reason codes, not addresses or paths")
+        rejection_counts[name] = _uint(count, f"cameraProbe.rejections.{name}", maximum=0xFFFFFFFFFFFFFFFF)
+
+    raw_frames = probe["frames"]
+    if type(raw_frames) is not list or len(raw_frames) > maximum_dispatches:
+        raise ReportError("cameraProbe.frames must contain at most 12 entries")
+    frames: list[dict[str, Any]] = []
+    previous_frame = 0
+    sample_count_names = (
+        "validDepthSamples", "backgroundSamples", "invalidDepthSamples", "validMotionSamples",
+        "cpuGpuComparedSamples", "cpuGpuMismatchSamples",
+    )
+    for index, raw_frame in enumerate(raw_frames):
+        where = f"cameraProbe.frames[{index}]"
+        frame = _object(raw_frame, where)
+        _required(frame, CAMERA_PROBE_FRAME_FIELDS, where)
+        _unknown(frame, CAMERA_PROBE_FRAME_FIELDS, where, unknown)
+        frame_values = {
+            name: _uint(frame[name], f"{where}.{name}")
+            for name in ("frame", "width", "height", "depthToken", "depthFormat",
+                         "sceneColorToken", "uiColorToken")
+        }
+        if frame_values["frame"] == 0 or frame_values["frame"] <= previous_frame:
+            raise ReportError(f"{where}.frame values must be positive and strictly increasing")
+        if frame_values["frame"] > counters["sourceFrames"] + (1 if partial_frame else 0):
+            raise ReportError(f"{where}.frame exceeds sourceFrames plus partialFrame")
+        previous_frame = frame_values["frame"]
+        if frame_values["width"] == 0 or frame_values["height"] == 0:
+            raise ReportError(f"{where}.width and height must be positive")
+        residual = _finite_number(frame["cameraVPResidual"], f"{where}.cameraVPResidual")
+        status = _string(frame["status"], f"{where}.status", 32)
+        if status not in ("pending", "ok", "gpu-failed", "timed-out"):
+            raise ReportError(f"{where}.status is not a supported probe status")
+        samples = {name: _uint(frame[name], f"{where}.{name}", maximum=2304)
+                   for name in sample_count_names}
+        if samples["cpuGpuMismatchSamples"] > samples["cpuGpuComparedSamples"]:
+            raise ReportError(f"{where}.cpuGpuMismatchSamples exceeds cpuGpuComparedSamples")
+        frame_values.update(samples)
+        frame_values["cameraVPResidual"] = residual
+        for name in ("maxErrorPixels", "meanMotionPixels", "maxMotionPixels"):
+            metric = _finite_number(frame[name], f"{where}.{name}")
+            if metric < 0:
+                raise ReportError(f"{where}.{name} must be nonnegative")
+            frame_values[name] = metric
+        frame_values["status"] = status
+        frame_values["hudAfterBoundary"] = _bool(frame["hudAfterBoundary"], f"{where}.hudAfterBoundary")
+        frames.append(frame_values)
+
+    if counters["scheduled"] != len(frames):
+        raise ReportError("cameraProbe.scheduled must equal the number of frame results")
+    if counters["scheduled"] != counters["completed"] + counters["gpuFailures"] + counters["pending"]:
+        raise ReportError("cameraProbe dispatch ledger does not balance")
+    statuses = Counter(frame["status"] for frame in frames)
+    if statuses["ok"] != counters["completed"] or statuses["gpu-failed"] != counters["gpuFailures"]:
+        raise ReportError("cameraProbe frame statuses do not match completed/GPU-failure counts")
+    if statuses["pending"] + statuses["timed-out"] != counters["pending"]:
+        raise ReportError("cameraProbe pending/timed-out frame statuses do not match pending count")
+    if timed_out != (counters["pending"] > 0):
+        raise ReportError("cameraProbe.timedOut must be true exactly when pending work remains")
+
+    if not requested:
+        if mode != "off" or any(counters.values()) or partial_frame or timed_out or rejections or frames:
+            raise ReportError("an unrequested cameraProbe must be off with zero counters and no frames")
+    elif mode != "camera-only-depth-probe":
+        raise ReportError("a requested cameraProbe must use camera-only-depth-probe mode")
+
+    return {
+        "requested": requested, "mode": mode, "session": probe_session, "grid": grid,
+        "maximumDispatches": maximum_dispatches, **counters, "partialFrame": partial_frame,
+        "timedOut": timed_out,
+        "readyForTemporal": False, "limitations": limitations,
+        "rejections": rejection_counts, "frames": frames,
+    }
 
 
 def _string(value: Any, where: str, max_length: int = 4096) -> str:
@@ -209,7 +360,7 @@ def _validate_record(raw: Any, index: int, unknown: list[str]) -> dict[str, Any]
         "uniform_tokens": uniform_tokens, "flags": record["flags"],
         "camera": {
             "valid_bit": valid == 1, "viewport": camera["viewportToken"], "size": size,
-            "near_far": near_far, "view": view, "projection": projection,
+            "near_far": near_far, "view_candidate": view, "projection_candidate": projection,
         },
         "color": colors, "depth": depth_info, "source_presentation": source_presentation_info,
         "pixel": pixel, "viewport_values": viewport, "wvp": wvp,
@@ -225,19 +376,33 @@ def _load_and_validate(data: bytes) -> tuple[dict[str, Any], list[dict[str, Any]
     except (UnicodeDecodeError, ValueError, RecursionError) as exc:
         raise ReportError(f"invalid JSON: {exc}") from exc
     root = _object(root_raw, "root")
-    _required(root, ROOT_REQUIRED, "root")
+    schema = _uint(root.get("schema"), "schema", maximum=0x7FFFFFFF)
+    if schema not in (1, 2):
+        raise ReportError(f"unsupported schema version {schema}; expected 1 or 2")
+    schema2_root_fields = {"baseCommitRole", "buildCommit", "cameraProbe", "cameraLayoutVersion"}
+    _required(root, ROOT_REQUIRED | (schema2_root_fields if schema == 2 else set()), "root")
     unknown: list[str] = []
     root_allowed = ROOT_REQUIRED | {"fileOmittedRecords"}
+    if schema == 2:
+        root_allowed |= schema2_root_fields | {"tokenSemantics"}
     _unknown(root, root_allowed, "root", unknown)
-    schema = _uint(root["schema"], "schema", maximum=0x7FFFFFFF)
-    if schema != 1:
-        raise ReportError(f"unsupported schema version {schema}; expected 1")
     for field in ("purpose", "engineSHA256", "baseCommit", "privacy", "limitations"):
         _string(root[field], field)
     if len(root["engineSHA256"]) != 64 or not re.fullmatch(r"[0-9a-fA-F]{64}", root["engineSHA256"]):
         raise ReportError("engineSHA256 must be 64 hexadecimal characters")
     if len(root["baseCommit"]) != 40 or not re.fullmatch(r"[0-9a-fA-F]{40}", root["baseCommit"]):
         raise ReportError("baseCommit must be 40 hexadecimal characters")
+    if schema == 2:
+        _string(root["baseCommitRole"], "baseCommitRole", 512)
+        build_commit = _string(root["buildCommit"], "buildCommit", 40)
+        if build_commit != "unknown" and (len(build_commit) != 40 or
+                                           not re.fullmatch(r"[0-9a-fA-F]{40}", build_commit)):
+            raise ReportError("buildCommit must be 40 hexadecimal characters or 'unknown'")
+        camera_layout_version = _uint(root["cameraLayoutVersion"], "cameraLayoutVersion")
+        if camera_layout_version != 2:
+            raise ReportError("cameraLayoutVersion must be 2 for schema 2")
+        if "tokenSemantics" in root:
+            _string(root["tokenSemantics"], "tokenSemantics", 1024)
     session = _string(root["session"], "session", 16)
     if not _HEX16.fullmatch(session):
         raise ReportError("session must be a 16-character hexadecimal string")
@@ -248,10 +413,12 @@ def _load_and_validate(data: bytes) -> tuple[dict[str, Any], list[dict[str, Any]
         _uint(root["fileOmittedRecords"], "fileOmittedRecords", maximum=MAX_RECORDS)
 
     stats = _object(root["stats"], "stats")
-    _required(stats, STAT_FIELDS, "stats")
-    _unknown(stats, STAT_FIELDS, "stats", unknown)
-    for name in STAT_FIELDS:
+    stat_fields = STAT_FIELDS | (SCHEMA2_STAT_FIELDS if schema == 2 else set())
+    _required(stats, stat_fields, "stats")
+    _unknown(stats, stat_fields, "stats", unknown)
+    for name in stat_fields:
         _uint(stats[name], f"stats.{name}", maximum=0xFFFFFFFFFFFFFFFF)
+    camera_probe = _validate_camera_probe(root["cameraProbe"], session, unknown) if schema == 2 else None
 
     manifest = root["shaderManifest"]
     if type(manifest) is not list or len(manifest) > MAX_MANIFEST:
@@ -268,7 +435,11 @@ def _load_and_validate(data: bytes) -> tuple[dict[str, Any], list[dict[str, Any]
     if type(raw_records) is not list or len(raw_records) > MAX_RECORDS:
         raise ReportError(f"records must be an array with at most {MAX_RECORDS} entries")
     records = [_validate_record(item, index, unknown) for index, item in enumerate(raw_records)]
-    return {**root, "stats": stats, "sourcePresentCount": present_count}, records, unknown
+    normalized_root = {**root, "schema": schema, "stats": stats,
+                       "sourcePresentCount": present_count}
+    if schema == 2:
+        normalized_root["cameraProbe"] = camera_probe
+    return normalized_root, records, unknown
 
 
 def _share_aliases(records: list[dict[str, Any]], field: str) -> list[dict[str, int]]:
@@ -289,6 +460,7 @@ def _share_aliases(records: list[dict[str, Any]], field: str) -> list[dict[str, 
 
 def analyze_report_bytes(data: bytes) -> dict[str, Any]:
     root, records, unknown = _load_and_validate(data)
+    schema = root["schema"]
     stats = root["stats"]
     source_count = root["sourcePresentCount"]
     stage_counts: Counter[int] = Counter(row["stage"] for row in records)
@@ -305,13 +477,13 @@ def analyze_report_bytes(data: bytes) -> dict[str, Any]:
     for row in records:
         camera = row["camera"]
         finite = (all(v is not None for v in camera["near_far"])
-                  and all(v is not None for v in camera["view"])
-                  and all(v is not None for v in camera["projection"]))
+                  and all(v is not None for v in camera["view_candidate"])
+                  and all(v is not None for v in camera["projection_candidate"]))
         if all(v is not None for v in camera["near_far"]):
             camera_finite_counts["nearFar"] += 1
-        if all(v is not None for v in camera["view"]):
+        if all(v is not None for v in camera["view_candidate"]):
             camera_finite_counts["view"] += 1
-        if all(v is not None for v in camera["projection"]):
+        if all(v is not None for v in camera["projection_candidate"]):
             camera_finite_counts["projection"] += 1
         near, far = camera["near_far"]
         range_ok = near is not None and far is not None and near > 0 and far > near
@@ -323,7 +495,7 @@ def analyze_report_bytes(data: bytes) -> dict[str, Any]:
             if camera["viewport"]:
                 valid_viewports[camera["viewport"]].add(tuple(camera["size"]))
                 signature = (tuple(camera["size"]), tuple(camera["near_far"]),
-                             tuple(camera["view"]), tuple(camera["projection"]))
+                             tuple(camera["view_candidate"]), tuple(camera["projection_candidate"]))
                 group = (camera["viewport"], row["frame"])
                 repeated_camera_groups[group].add(signature)
                 camera_group_observations[group] += 1
@@ -423,11 +595,51 @@ def analyze_report_bytes(data: bytes) -> dict[str, Any]:
         schema_warning.append("Packet-table collisions were observed and may reduce metadata matches.")
     if truncation["claimedButNotPublished"] or truncation["publishedButUnmatched"] or stats["invalidRecord"]:
         schema_warning.append("Packet accounting has gaps; these are metadata-collection signals, not frame-loss or performance measurements.")
+    if schema == 2 and stats["transientTokenEvictions"]:
+        schema_warning.append("Transient identity mappings were evicted; the same object may receive a new opaque token later, splitting apparent continuity.")
+
+    if schema == 1 and root["engineSHA256"].lower() == LEGACY_CAMERA_ENGINE_SHA256:
+        camera_layout_note = (
+            "Pinned schema-1 engine camera.viewCandidate is camera-to-world copied from legacy viewport offset 192, not a view matrix. "
+            "The candidate values are retained as captured and are not inverted or relabeled; do not treat them as view without verified affine-rigid inversion."
+        )
+    elif schema == 1:
+        camera_layout_note = (
+            "Schema 1 has no explicit cameraLayoutVersion. camera.viewCandidate is retained as captured and is not transformed; "
+            "verify the source layout before treating it as view."
+        )
+    else:
+        camera_layout_note = (
+            "cameraLayoutVersion 2 declares camera.viewCandidate as view at viewport offset 256 and projectionCandidate at offset 320; "
+            "the analyzer keeps these as numerical candidates and does not transform them."
+        )
+    if schema == 1:
+        schema_warning.insert(0, camera_layout_note)
+
+    loss_summary = {
+        "truncationAndOverflowSignals": truncation,
+        "warnings": schema_warning,
+        "unknownFieldSummary": unknown_summary,
+        "missesMeaning": "Packet lookup misses include uninstrumented/unsampled commands and are not a dropped-frame rate or a performance measurement.",
+    }
+    if schema == 2:
+        loss_summary["intentionalDiagnosticSampling"] = {
+            "quotaDroppedRecords": stats["quotaDroppedRecords"],
+            "downsampledFrames": stats["downsampledFrames"],
+            "note": "These are intentional per-frame diagnostic sampling limits, not missed or dropped game frames and not an FPS measurement.",
+        }
+        loss_summary["tokenPoolSignals"] = {
+            "resourceTokenOverflow": stats["resourceTokenOverflow"],
+            "candidateTokenOverflow": stats["candidateTokenOverflow"],
+            "transientTokenOverflow": stats["transientTokenOverflow"],
+            "transientTokenEvictions": stats["transientTokenEvictions"],
+            "note": "Opaque IDs do not reveal raw identities; bounded cache evictions can split token continuity, and zero means unavailable.",
+        }
 
     unique_frame_count = len(recorded_frames)
     camera_rate = (camera_candidates / len(records)) if records else 0.0
-    return {
-        "schema": 1,
+    summary = {
+        "schema": schema,
         "input": {"records": len(records), "sourcePresentCount": source_count,
                   "distinctRecordedFrameIndices": unique_frame_count,
                   "recordedFrameIndexMin": min(recorded_frames) if recorded_frames else None,
@@ -457,7 +669,8 @@ def analyze_report_bytes(data: bytes) -> dict[str, Any]:
             "viewportTokenSizeChanges": changed_viewports,
             "sameViewportSameFrameStableMatrixGroups": stable_repeated_cameras,
             "sameViewportSameFrameChangedMatrixGroups": changed_repeated_cameras,
-            "note": "Numeric/range plus repeated same-token/same-frame candidate checks only; camera semantics, matrix meaning, and projection correctness are not certified.",
+            "note": "Numeric/range plus repeated same-token/same-frame candidate checks only; camera semantics and projection correctness are not certified.",
+            "cameraLayoutNote": camera_layout_note,
         },
         "candidateEntityTokenCoverage": {
             "distinctNonzeroCandidates": len(candidate_frames),
@@ -503,16 +716,22 @@ def analyze_report_bytes(data: bytes) -> dict[str, Any]:
             "note": "This is the engine source-presentation texture before Spatial processing, not the CAMetalDrawable/display texture.",
         },
         "collectorStats": {name: stats[name] for name in sorted(stats)},
-        "lossAndUnknowns": {
-            "truncationAndOverflowSignals": truncation,
-            "warnings": schema_warning,
-            "unknownFieldSummary": unknown_summary,
-            "missesMeaning": "Packet lookup misses include uninstrumented/unsampled commands and are not a dropped-frame rate or a performance measurement.",
-        },
+        "lossAndUnknowns": loss_summary,
         "readyForTemporal": False,
-        "temporalReadinessReason": "This report contains no validated motion-vector stream; camera, matrix, depth, token, or attachment candidates are not proof of motion data, jitter, disocclusion handling, or complete coverage.",
+        "temporalReadinessReason": "This report contains no validated per-pixel motion-vector stream for actor motion; camera-only reprojection, matrix, depth, token, or attachment candidates are not proof of actor motion, jitter, disocclusion handling, or complete coverage.",
         "performanceOrQualityClaims": "Not measured; this summary does not calculate performance or image-quality percentages.",
     }
+    if schema == 2:
+        summary["baseCommit"] = root["baseCommit"]
+        summary["baseCommitRole"] = root["baseCommitRole"]
+        summary["buildCommit"] = root["buildCommit"]
+        summary["cameraLayoutVersion"] = root["cameraLayoutVersion"]
+        summary["cameraProbe"] = root["cameraProbe"]
+        if "tokenSemantics" in root:
+            summary["tokenSemantics"] = root["tokenSemantics"]
+    else:
+        summary["cameraLayoutWarning"] = camera_layout_note
+    return summary
 
 
 def _uniform_aliases(records: list[dict[str, Any]]) -> list[dict[str, int]]:
@@ -551,7 +770,7 @@ def _human_summary(summary: dict[str, Any]) -> str:
     coverage = ", ".join(f"{item['stage']} {item['stageName']}/op {item['opcode']} {item['opcodeName']}: {item['records']}"
                          for item in summary["stageOpcodeCoverage"]) or "none"
     camera = summary["cameraCandidateChecks"]
-    return "\n".join([
+    lines = [
         f"Schema {summary['schema']}: {summary['input']['records']} records, "
         f"{summary['input']['sourcePresentCount']} source presents",
         f"Stage/op coverage: {coverage}",
@@ -561,7 +780,19 @@ def _human_summary(summary: dict[str, Any]) -> str:
         f"{summary['candidateEntityTokenCoverage']['candidateCoveredFrameIndices']} frame indices covered",
         "Ready for Temporal: false (no validated motion-vector stream)",
         "No performance or image-quality claims are computed.",
-    ])
+    ]
+    if summary["schema"] == 2:
+        sampling = summary["lossAndUnknowns"]["intentionalDiagnosticSampling"]
+        lines.insert(3, f"Diagnostic sampling: {sampling['quotaDroppedRecords']} quota drops across "
+                    f"{sampling['downsampledFrames']} sampled frames (not game-frame loss or FPS).")
+        probe = summary["cameraProbe"]
+        lines.insert(4, f"Camera-only probe: {probe['mode']}, {probe['completed']} completed, "
+                    f"{probe['pending']} pending; it does not enable Temporal readiness.")
+        lines.insert(5, f"Camera layout v{summary['cameraLayoutVersion']}: "
+                    f"{summary['cameraCandidateChecks']['cameraLayoutNote']}")
+    elif summary["schema"] == 1:
+        lines.insert(3, f"Camera-layout warning: {summary['cameraLayoutWarning']}")
+    return "\n".join(lines)
 
 
 def main(argv: list[str] | None = None) -> int:

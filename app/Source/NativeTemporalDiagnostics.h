@@ -8,13 +8,17 @@ extern "C" {
 
 #define PGTD_MAX_RECORDS 2048u
 #define PGTD_PACKET_SLOTS 2048u
-#define PGTD_TOKEN_CAPACITY 1024u
+#define PGTD_TOKEN_CAPACITY 2048u
+#define PGTD_CANDIDATE_TOKEN_CAPACITY 512u
+#define PGTD_TRANSIENT_TOKEN_CAPACITY 512u
 #define PGTD_TAG_BUDGET 8192u
 #define PGTD_SCOPE_MAX_DEPTH 16u
+#define PGTD_RECORDS_PER_FRAME 32u
 
 #define PGTD_SCOPE_FLAG_KEY_VALID UINT32_C(0x00000001)
 #define PGTD_TAG_FLAG_KEY_VALID UINT32_C(0x40000000)
 #define PGTD_TAG_FLAG_ENTITY_UNKNOWN UINT32_C(0x20000000)
+#define PGTD_TAG_FLAG_SELECTED_SAMPLE UINT32_C(0x10000000)
 #define PGTD_TAG_FLAG_CAMERA_INVALID UINT32_C(0x80000000)
 
 typedef struct PGTDCamera {
@@ -99,6 +103,12 @@ typedef struct PGTDStats {
 	uint64_t invalidRecord;
 	uint64_t threadOverflow;
 	uint64_t truncatedRecords;
+	uint64_t quotaDroppedRecords;
+	uint64_t transientTokenEvictions;
+	uint64_t resourceTokenOverflow;
+	uint64_t candidateTokenOverflow;
+	uint64_t transientTokenOverflow;
+	uint64_t downsampledFrames;
 } PGTDStats;
 
 typedef struct PGTDReport {
