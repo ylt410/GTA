@@ -85,7 +85,10 @@ private:
 	}
 
 	void ensureUnique() {
-		if (payload_ && payload_.unique()) return;
+		// shared_ptr::unique is deprecated in C++17 and removed in C++20.
+		// This is an ownership check, not synchronization: callers must still
+		// obey the wrapper and raw-pointer lifetime contract above.
+		if (payload_ && payload_.use_count() == 1) return;
 		const size_t oldSize = payload_ ? payload_->bytes.size() : 0;
 		// Co-allocate the small payload owner and shared control block.
 		auto replacement = std::make_shared<Payload>();

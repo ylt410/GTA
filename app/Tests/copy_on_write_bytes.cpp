@@ -19,6 +19,13 @@ int main() {
 	src.resize(expected.size());
 	for (size_t i = 0; i < expected.size(); ++i) expected[i] = uint8_t((i * 37u + 9u) & 255u);
 	std::copy(expected.begin(), expected.end(), src.mutableData());
+	// An exclusive owner keeps its backing and does not create/clone a payload.
+	const uint8_t *exclusiveData = src.data();
+	const auto beforeExclusiveWrite = CopyOnWriteBytes::statistics();
+	assert(src.mutableData() == exclusiveData);
+	const auto afterExclusiveWrite = CopyOnWriteBytes::statistics();
+	assert(afterExclusiveWrite.cloneBytes == beforeExclusiveWrite.cloneBytes);
+	assert(afterExclusiveWrite.payloadAllocations == beforeExclusiveWrite.payloadAllocations);
 
 	// CopyResource-like snapshot: cheap shared copy, then independent partial writes.
 	CopyOnWriteBytes dst = src;
@@ -30,8 +37,23 @@ int main() {
 	assert(src.data() == dst.data());
 	assert(afterSameSizeResize.cloneBytes == beforeSameSizeResize.cloneBytes);
 	for (size_t i = 700; i < 901; ++i) { dst.mutableData()[i] ^= 0x5a; expectedDst[i] ^= 0x5a; }
+	const auto afterSharedWrite = CopyOnWriteBytes::statistics();
+	assert(afterSharedWrite.cloneBytes == afterSameSizeResize.cloneBytes + expected.size());
+	assert(afterSharedWrite.payloadAllocations == afterSameSizeResize.payloadAllocations + 1);
 	same(src, expected); same(dst, expectedDst);
 	assert(src.data() != dst.data());
+	// Once the other owner detaches, the original is exclusive again.
+	assert(src.mutableData() == exclusiveData);
+	assert(CopyOnWriteBytes::statistics().cloneBytes == afterSharedWrite.cloneBytes);
+	{
+		CopyOnWriteBytes released = src;
+		assert(released.data() == exclusiveData);
+	}
+	const auto beforeReleasedOwnerWrite = CopyOnWriteBytes::statistics();
+	assert(src.mutableData() == exclusiveData);
+	const auto afterReleasedOwnerWrite = CopyOnWriteBytes::statistics();
+	assert(afterReleasedOwnerWrite.cloneBytes == beforeReleasedOwnerWrite.cloneBytes);
+	assert(afterReleasedOwnerWrite.payloadAllocations == beforeReleasedOwnerWrite.payloadAllocations);
 
 	// Destroying the source must not invalidate a copied destination.
 	{

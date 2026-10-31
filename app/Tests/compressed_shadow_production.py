@@ -113,6 +113,9 @@ with tempfile.TemporaryDirectory(prefix="compressed-shadow-") as tmp:
 	cpp.write_text(HARNESS)
 	compiler = os.environ.get("CXX") or shutil.which("c++")
 	if not compiler: raise RuntimeError("C++ compiler required for production shadow tests")
-	cmd = [compiler, "-std=c++17", "-O2", "-Wall", "-Wextra", "-Werror", "-I", str(HEADER.parent), str(cpp), "-o", str(binary)]
-	subprocess.run(cmd, check=True)
-	subprocess.run([str(binary)], check=True)
+	# Exercise both the portable-test dialect and the renderer's C++20 dialect.
+	# Keep deprecation warnings fatal, including libc++'s C++17 diagnostics.
+	for standard in ("c++17", "c++20"):
+		cmd = [compiler, "-std=" + standard, "-O2", "-Wall", "-Wextra", "-Werror", "-I", str(HEADER.parent), str(cpp), "-o", str(binary)]
+		subprocess.run(cmd, check=True)
+		subprocess.run([str(binary)], check=True)
