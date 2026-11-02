@@ -23,14 +23,6 @@ void PGSetSuperResolution(int mode, int outputWidth, int outputHeight);
 void PGSetPresentInterval(double seconds);
 // Thread-safe request; the renderer only trims unused backing after GPU completion.
 void PGRequestRendererMemoryReclaim(void);
-// Opt-in, bounded input-contract diagnostics. This does NOT enable Temporal.
-void PGTemporalDiagnosticsStart(void);
-// Experimental, opt-in sparse camera/depth probe; does not enable Temporal.
-void PGTemporalDiagnosticsStartCameraProbe(void);
-int PGTemporalDiagnosticsIsCameraProbe(void);
-void PGTemporalDiagnosticsStop(void);
-int PGTemporalDiagnosticsStatus(void); // idle, armed, recording, saving, ready, failed
-const char *PGTemporalDiagnosticsReportPath(void);
 #ifdef __cplusplus
 }
 #endif

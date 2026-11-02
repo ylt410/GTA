@@ -8,6 +8,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <errno.h>
+#include <time.h>
 #include "NativePackedAssetCache.h"
 #include "NativePackedAssetMigration.h"
 #include "NativeAssetPreload.h"
@@ -1224,7 +1225,7 @@ static void *assetHintLoop(void *unused){
   pthread_setname_np("gta.asset.hints");if(assetBalancedQOS)pthread_set_qos_class_self_np(QOS_CLASS_UTILITY,0);
   wasm_rt_trap_t trap=wasm_rt_impl_try();if(trap){pg_log("Native asset hint worker encountered invalid engine memory.");return NULL;}
   _Atomic int32_t *table=pg_pointer(assetHost,assetTable,64);double report=assetNowMS();
-  for(;;){int32_t bell=atomic_load(table);@autoreleasepool {
+  for(;;){@autoreleasepool {
     uint32_t ring=atomic_load(table+2),capacity=atomic_load(table+3),head=atomic_load(table+4),tail=atomic_load(table+5);
     if(ring&&capacity){uint32_t oldest=pg_asset_hint_oldest(head,tail,capacity);hintsLapped+=(uint32_t)(oldest-tail);tail=oldest;
       while(tail!=head){uint64_t address=assetTable+((uint64_t)ring+(uint64_t)(tail%capacity)*4)*4;_Atomic int32_t *entry=pg_pointer(assetHost,address,16);uint32_t raw=atomic_load(entry+3);if(!raw)break;
@@ -1236,7 +1237,15 @@ static void *assetHintLoop(void *unused){
     }
     pumpAssetHints();double now=assetNowMS();if(now-report>=10000){char line[384];snprintf(line,sizeof line,"Native asset hints: normal %llu, speculative %llu, scheduled %llu, cached %llu, lapped %llu, queues %u/%u, active %d/%d.",hintsNormalSeen,hintsLowSeen,hintsScheduled,hintsCached,hintsLapped,normalHints.count,lowHints.count,atomic_load(&activePrefetch),atomic_load(&activeSpeculative));pg_log(line);
       if(localDataRoot){snprintf(line,sizeof line,"Native local readahead: %llu hints, %llu advisory calls, %llu bytes advised, %llu errors, %llu duplicates skipped, %llu throttled polls, %llu busy skips, %llu temporary opens, %llu old queued hints dropped; copied reads 0.",localAdvice.hints,localAdvice.calls,localAdvice.bytes,localAdvice.errors,localAdvice.duplicates,localAdvice.throttled,localAdvice.busy,localAdvice.coldOpens,localAdvice.dropped);pg_log(line);}report=now;}
-  }pg_atomic_wait32(w2c_env_memory(assetHost),assetTable,bell,10000000);}
+  }
+    // wasm_httpfs_pread publishes a demand slot and notifies exactly ONE
+    // waiter on assetTable. An optional hint consumer must not steal that
+    // wakeup: it cannot service the demand slot, leaving a read stalled until
+    // the old 10 ms polling timeout. Hints already need periodic pumping when
+    // network jobs finish, so keep their existing cadence on a separate timer.
+    struct timespec delay={.tv_sec=0,.tv_nsec=10000000};
+    while(nanosleep(&delay,&delay)<0&&errno==EINTR){}
+  }
 }
 static void *assetLoop(void *unused) {
   char workerName[32];snprintf(workerName,sizeof workerName,"gta.asset.read.%ld",(long)(intptr_t)unused);pthread_setname_np(workerName);
@@ -1247,7 +1256,12 @@ static void *assetLoop(void *unused) {
     if(count<0||count>4096){pg_log("Invalid native asset slot count.");return NULL;}
     for(int i=0;i<count;i++) {
       uint64_t address=assetTable+(16+(uint64_t)i*16)*4;
-      _Atomic int32_t *slot=pg_pointer(assetHost,address,64);int32_t expected=1;
+      _Atomic int32_t *slot=pg_pointer(assetHost,address,64);
+      // Only ready slots need an exclusive read/modify/write. All six workers
+      // may scan the same queue, but idle, completed and busy cache lines need
+      // no compare-exchange. The CAS still arbitrates simultaneous claimers.
+      if(atomic_load_explicit(slot,memory_order_relaxed)!=1)continue;
+      int32_t expected=1;
       if(!atomic_compare_exchange_strong(slot,&expected,3))continue;
       @autoreleasepool {
         uint32_t id=atomic_load(slot+1),len=atomic_load(slot+6);
@@ -1273,7 +1287,13 @@ static void *assetLoop(void *unused) {
       dispatch_async(prefetchQueue,^{@autoreleasepool {assetPrefetchRead=assetSpeculativeRead=true;uint8_t *bytes=malloc(length);if(bytes){readAsset(id,offset,bytes,length);free(bytes);}assetPrefetchRead=assetSpeculativeRead=false;atomic_fetch_sub(&activePrefetch,1);}});
     }
     }
-    pg_atomic_wait32(w2c_env_memory(assetHost),assetTable,bell,10000000);
+    // The producer increments the bell before notify(1); pg_atomic_wait32
+    // rechecks it while joining the wait queue. A publication during this scan
+    // therefore cannot be lost. With the separate hint worker, demand reads
+    // are event-driven instead of six idle threads polling 100 times/second.
+    // The old combined-hints compatibility path still needs its periodic poll.
+    pg_atomic_wait32(w2c_env_memory(assetHost),assetTable,bell,
+                     assetQueuedHints?UINT64_MAX:10000000);
   }
 }
 void w2c_env_wasm_httpfs_io_start_js(struct w2c_env *host,u64 table) {

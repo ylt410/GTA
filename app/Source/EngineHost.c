@@ -10,6 +10,7 @@ static void pg_mod_test_recheck(void);
 #include "NativeEngineConfiguration.h"
 #include "NativeArchiveLookup.h"
 #include "NativeControllerLook.h"
+#include "NativeAudioContinuity.h"
 #include "NativeTouchContext.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -54,7 +55,6 @@ uint64_t PGProcessAvailableMemory(void) {
 }
 
 static struct w2c_env env;
-#include "NativeTemporalEngine.inc"
 static struct w2c_wasi__snapshot__preview1 wasi = { .env = &env };
 static PGLogCallback logCallback;
 static void *logContext;
@@ -163,7 +163,6 @@ void w2c_env_0x5Femscripten_throw_longjmp(struct w2c_env *host) {
   if (!frame) pg_missing_import("env._emscripten_throw_longjmp");
   static _Atomic int logged;
   if (atomic_fetch_add(&logged, 1) < 20) pg_log("The engine handled an error with longjmp; the game continues.");
-  PGTDInvalidateThread(); // Native unwinding bypasses generated-C scope exits.
   _longjmp(frame->jump, 1);
 }
 // Where fiDeviceMemory::Create finds the address in "memory:$0x...,size,flags:name"
@@ -2924,9 +2923,14 @@ int32_t PGLastInputDevice(void) {
 }
 
 void PGFillAudio(float *left, float *right, uint32_t count) {
-  memset(left, 0, count * sizeof(float)); memset(right, 0, count * sizeof(float));
+  static PGAudioContinuity continuity;
+  static uint64_t consumerRing;
   uint64_t ring = atomic_load(&audioRing);
-  if (!ring) return;
+  if (!ring) {
+    memset(left, 0, count * sizeof(float)); memset(right, 0, count * sizeof(float));
+    pg_audio_continuity_reset(&continuity); consumerRing = 0; return;
+  }
+  if (ring != consumerRing) { pg_audio_continuity_reset(&continuity); consumerRing = ring; }
   uint32_t capacity = atomic_load(&audioCapacity);
   _Atomic uint32_t *header = pg_pointer(&env, ring, 64 + (u64)capacity * 8);
   float *data = (float *)((uint8_t *)(void *)header + 64);
@@ -2934,10 +2938,7 @@ void PGFillAudio(float *left, float *right, uint32_t count) {
   uint32_t available = write - read;
   uint32_t take = available < count ? available : count;
   if (take > capacity) take = capacity;
-  for (uint32_t i = 0; i < take; i++) {
-    uint32_t at = ((read + i) & (capacity - 1)) * 2;
-    left[i] = data[at]; right[i] = data[at + 1];
-  }
+  pg_audio_continuity_render(&continuity, data, capacity, read, take, left, right, count);
   atomic_store(header + 1, read + take);
   atomic_fetch_add(header + 3, 1);
 #if TARGET_OS_SIMULATOR
@@ -3317,7 +3318,6 @@ void pg_drop_destroyed_phases(w2c_game *instance) {
 }
 void pg_note_call_indirect(const char *function,uint32_t index,uint32_t size){indirectFunction=function;indirectIndex=index;indirectSize=size;}
 void pg_record_trap(int code) {
-  PGTDInvalidateThread();
   pg_invoke_top=NULL; // the trap leaves every invoke_* on this thread, so their jump points are gone
   void *frames[20];int count=backtrace(frames,20);char line[160];
   snprintf(line,sizeof line,"Native trap %d; app image base %p",code,_dyld_get_image_header(0));pg_log(line);

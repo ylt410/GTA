@@ -12,7 +12,9 @@
 #include "MRFrameReports.h"
 #include "MRGpuFrameTiming.h"
 #include "MRImmediateCache.h"
+#include "MRTextureUploadPolicy.h"
 #include "MRBindingPlan.h"
+#include "MRLayoutIdentity.h"
 #include "MRConstantUpload.h"
 #include "MRRenderTargetCache.h"
 #include "MRUploadRingRetention.h"
@@ -24,8 +26,6 @@
 #include "BCTextureDecoder.h"
 #include "BC1ToASTC.h"
 #include "NativeGraphics.h"
-#include "NativeTemporalDiagnosticsPlatform.h"
-#include "NativeTemporalCameraProbe.h"
 #include "NativeFrameRate.h"
 #import <UIKit/UIKit.h>
 #if __has_include(<MetalFX/MetalFX.h>) && !TARGET_OS_SIMULATOR		// iPhone SDK only
@@ -304,6 +304,20 @@ struct Renderer {
 };
 
 static Renderer *R;
+
+// Layout descriptions are interned on the renderer thread. The interner owns
+// only copied CPU descriptors; object IDs are removed when their Layout dies.
+static mr::LayoutIdentityCache layoutIdentityCache;
+
+static uint64_t layoutIdentity(const Layout *layout) {
+	if (uint64_t identity = layoutIdentityCache.identityForObject(layout->oid)) return identity;
+	mr::LayoutIdentityInterner::Description description;
+	description.reserve(layout->els.size());
+	for (const LayoutEl &element : layout->els)
+		description.push_back({element.sem, element.idx, element.fmt, element.slot,
+			element.offset, element.cls, element.rate});
+	return layoutIdentityCache.identityForObject(layout->oid, description);
+}
 
 // ---- debug trace (simulator only, env PG_MR_TRACE=<seconds after the world is shown>) ---------------------------------
 // Writes every command of one frame (draws with their shaders, targets, states and textures; clears, copies) to
@@ -695,7 +709,7 @@ static void uploadBlocks(Texture *t, uint32_t level, uint32_t slice, uint32_t x,
                          uint32_t bpr, uint32_t imageBytes, const uint8_t *data) {
 	bool three = t->dim == 3;
 	MTLRegion region = MTLRegionMake3D(x, y, three ? z : 0, w, h, three ? d : 1);
-	if (t->shared && !inFlight(t->lastUse)) {
+	if (canReplaceSharedTexture(t->shared, t->lastUse, R->completion.completed())) {
 		if (three || d == 1) [t->tex replaceRegion:region mipmapLevel:level slice:three ? 0 : slice withBytes:data bytesPerRow:bpr bytesPerImage:three ? imageBytes : 0];
 		else for (uint32_t l = 0; l < d; l++) [t->tex replaceRegion:MTLRegionMake2D(x, y, w, h) mipmapLevel:level slice:slice + l withBytes:data + (size_t)l * imageBytes bytesPerRow:bpr bytesPerImage:0];
 	} else {
@@ -706,6 +720,15 @@ static void uploadBlocks(Texture *t, uint32_t level, uint32_t slice, uint32_t x,
 		else for (uint32_t l = 0; l < d; l++) [b copyFromBuffer:a.buf sourceOffset:a.off + (NSUInteger)l * imageBytes sourceBytesPerRow:bpr sourceBytesPerImage:imageBytes sourceSize:MTLSizeMake(w, h, 1) toTexture:t->tex destinationSlice:slice + l destinationLevel:level destinationOrigin:MTLOriginMake(x, y, 0)];
 		t->lastUse = R->serial;
 	}
+}
+
+static void uploadTextureFromAlloc(Texture *t, uint32_t level, uint32_t slice, uint32_t x, uint32_t y, uint32_t z, uint32_t w, uint32_t h, uint32_t d,
+                                   uint32_t bpr, uint32_t imageBytes, Alloc a) {
+	bool three = t->dim == 3;
+	id<MTLBlitCommandEncoder> b = blitEncoder();
+	if (three) [b copyFromBuffer:a.buf sourceOffset:a.off sourceBytesPerRow:bpr sourceBytesPerImage:imageBytes sourceSize:MTLSizeMake(w, h, d) toTexture:t->tex destinationSlice:0 destinationLevel:level destinationOrigin:MTLOriginMake(x, y, z)];
+	else for (uint32_t l = 0; l < d; l++) [b copyFromBuffer:a.buf sourceOffset:a.off + (NSUInteger)l * imageBytes sourceBytesPerRow:bpr sourceBytesPerImage:imageBytes sourceSize:MTLSizeMake(w, h, 1) toTexture:t->tex destinationSlice:slice + l destinationLevel:level destinationOrigin:MTLOriginMake(x, y, 0)];
+	t->lastUse = R->serial;
 }
 
 static void uploadTextureInner(const uint32_t *p);
@@ -786,6 +809,8 @@ static void uploadTextureInner(const uint32_t *p) {
 	if (mip < t->skip) return;		// Lite: the dropped level
 	const uint32_t level = mip - t->skip;		// the GPU texture's level for this mip
 	void *decoded = nullptr;
+	Alloc decodedRing{};
+	bool decodedInRing = false;
 	if (t->bcNative) {		// blocks go to the GPU as they are; rows and images count block rows
 		uint32_t mw, mh, md; mipExtent(t, mip, mw, mh, md);
 		w = std::min(w, mw - std::min(mw, x)); h = std::min(h, mh - std::min(mh, y));
@@ -798,7 +823,7 @@ static void uploadTextureInner(const uint32_t *p) {
 		size_t total = (size_t)imageBytes * (d - 1) + (size_t)bpr * blockRows;
 		if (total > size) { logOnce("bcnshort", "Metal renderer: compressed upload smaller than its region"); return; }
 		MTLRegion region = MTLRegionMake3D(x, y, three ? z : 0, w, h, three ? d : 1);
-		if (t->shared && !inFlight(t->lastUse)) {
+		if (canReplaceSharedTexture(t->shared, t->lastUse, R->completion.completed())) {
 			if (three || d == 1) [t->tex replaceRegion:region mipmapLevel:level slice:three ? 0 : slice withBytes:data bytesPerRow:bpr bytesPerImage:three ? imageBytes : 0];
 			else for (uint32_t l = 0; l < d; l++) [t->tex replaceRegion:MTLRegionMake2D(x, y, w, h) mipmapLevel:level slice:slice + l withBytes:data + (size_t)l * imageBytes bytesPerRow:bpr bytesPerImage:0];
 		} else {
@@ -835,37 +860,64 @@ static void uploadTextureInner(const uint32_t *p) {
 		size_t outSize = 0;
 		if (t->astc) {		// rewritten block by block, then uploaded as blocks (rows count block rows)
 			uint32_t astcBpr = 0, astcRpi = 0;
-			void *blocks = PGTranscodeBCToASTC(t->bcKind, w, h, d, bpr, rpi, data, size, &outSize, &astcBpr, &astcRpi);
-			if (!blocks) { gTextureStats.decodeFailures++; logOnce("astcfail", "Metal renderer: BC%u upload smaller than its region", t->bcKind); return; }
-			uploadBlocks(t, level, slice, x, y, z, w, h, d, astcBpr, astcBpr * astcRpi, (const uint8_t *)blocks);
-			free(blocks);
+			if (!PGTranscodeBCToASTCOutputSize(t->bcKind, w, h, d, bpr, rpi, data, size, &outSize, &astcBpr, &astcRpi)) {
+				gTextureStats.decodeFailures++; logOnce("astcfail", "Metal renderer: BC%u upload smaller than its region", t->bcKind); return;
+			}
+			uint64_t outputImage64 = (uint64_t)astcBpr * astcRpi;
+			if (outputImage64 > UINT32_MAX) { gTextureStats.decodeFailures++; logOnce("astcfail", "Metal renderer: BC%u image size overflow", t->bcKind); return; }
+			uint32_t astcImageBytes = (uint32_t)outputImage64;
+			size_t outputBytes = outSize;
+			bool directTexture = canReplaceSharedTexture(t->shared, t->lastUse, R->completion.completed());
+			Alloc staged{};
+			void *output = nullptr;
+			if (directTexture) output = malloc(outputBytes);
+			else { staged = frameAlloc(outputBytes, 16); output = staged.ptr; }
+			if (!output || !PGTranscodeBCToASTCInto(t->bcKind, w, h, d, bpr, rpi, data, size, output, outputBytes, &outSize, &astcBpr, &astcRpi)) {
+				if (directTexture) free(output);
+				gTextureStats.decodeFailures++; logOnce("astcfail", "Metal renderer: BC%u upload smaller than its region", t->bcKind); return;
+			}
+			if (directTexture) {
+				uploadBlocks(t, level, slice, x, y, z, w, h, d, astcBpr, astcImageBytes, (const uint8_t *)output);
+				free(output);
+			} else uploadTextureFromAlloc(t, level, slice, x, y, z, w, h, d, astcBpr, astcImageBytes, staged);
 			t->proxyDirty = true;
 			return;
 		}
-		decoded = PGDecodeBC(t->bcKind, w, h, d, bpr, rpi, data, size, &outSize);
-		if (!decoded) { gTextureStats.decodeFailures++; logOnce("bcfail", "Metal renderer: BC decode failed"); return; }
+		size_t decodedCapacity = 0;
+		if (!PGDecodeBCOutputSize(t->bcKind, w, h, d, bpr, rpi, data, size, &decodedCapacity)) {
+			gTextureStats.decodeFailures++; logOnce("bcfail", "Metal renderer: BC decode rejected the region"); return;
+		}
+		bool directTexture = canReplaceSharedTexture(t->shared, t->lastUse, R->completion.completed());
+		void *output = directTexture ? malloc(decodedCapacity) : nullptr;
+		if (!directTexture) { decodedRing = frameAlloc(decodedCapacity, 16); output = decodedRing.ptr; decodedInRing = true; }
+		if (!output || !PGDecodeBCInto(t->bcKind, w, h, d, bpr, rpi, data, size, output, decodedCapacity, &outSize)) {
+			if (directTexture) free(output);
+			else decodedInRing = false;
+			gTextureStats.decodeFailures++; logOnce("bcfail", "Metal renderer: BC decode failed"); return;
+		}
+		if (directTexture) decoded = output;
 		if (t->format == MTLPixelFormatA1BGR5Unorm) {		// RGBA8 to A1BGR5 in place: Metal names components from the lowest bit (A bit 0, B 1-5, G 6-10, R 11-15)
-			const uint8_t *in = (const uint8_t *)decoded; uint16_t *out = (uint16_t *)decoded;
+			const uint8_t *in = (const uint8_t *)output; uint16_t *out = (uint16_t *)output;
 			for (size_t i = 0, n = outSize / 4; i < n; i++, in += 4)
 				out[i] = (uint16_t)((in[0] >> 3) << 11 | (in[1] >> 3) << 6 | (in[2] >> 3) << 1 | (in[3] >= 128));
 			outSize /= 2;
 		}
-		data = (const uint8_t *)decoded; bpr = w * bytesPerTexel(t->format); rpi = h; size = (uint32_t)outSize;
+		data = (const uint8_t *)output; bpr = w * bytesPerTexel(t->format); rpi = h; size = (uint32_t)outSize;
 	}
 	uint32_t imageBytes = bpr * (rpi ? rpi : h);
 	bool three = t->dim == 3;
 	MTLRegion region = MTLRegionMake3D(x, y, three ? z : 0, w, h, three ? d : 1);
-	if (t->shared && !inFlight(t->lastUse)) {
+	if (canReplaceSharedTexture(t->shared, t->lastUse, R->completion.completed())) {
 		if (three || d == 1) [t->tex replaceRegion:region mipmapLevel:level slice:three ? 0 : slice withBytes:data bytesPerRow:bpr bytesPerImage:three ? imageBytes : 0];
 		else for (uint32_t l = 0; l < d; l++) [t->tex replaceRegion:MTLRegionMake2D(x, y, w, h) mipmapLevel:level slice:slice + l withBytes:data + (size_t)l * imageBytes bytesPerRow:bpr bytesPerImage:0];
 	} else {
 		size_t total = (size_t)imageBytes * d;
-		Alloc a = frameAlloc(total, 16);
-		memcpy(a.ptr, data, std::min<size_t>(total, size));
-		id<MTLBlitCommandEncoder> b = blitEncoder();
-		if (three) [b copyFromBuffer:a.buf sourceOffset:a.off sourceBytesPerRow:bpr sourceBytesPerImage:imageBytes sourceSize:MTLSizeMake(w, h, d) toTexture:t->tex destinationSlice:0 destinationLevel:level destinationOrigin:MTLOriginMake(x, y, z)];
-		else for (uint32_t l = 0; l < d; l++) [b copyFromBuffer:a.buf sourceOffset:a.off + (NSUInteger)l * imageBytes sourceBytesPerRow:bpr sourceBytesPerImage:imageBytes sourceSize:MTLSizeMake(w, h, 1) toTexture:t->tex destinationSlice:slice + l destinationLevel:level destinationOrigin:MTLOriginMake(x, y, 0)];
-		t->lastUse = R->serial;
+		if (decodedInRing) uploadTextureFromAlloc(t, level, slice, x, y, z, w, h, d, bpr, imageBytes, decodedRing);
+		else {
+			Alloc a = frameAlloc(total, 16);
+			memcpy(a.ptr, data, std::min<size_t>(total, size));
+			uploadTextureFromAlloc(t, level, slice, x, y, z, w, h, d, bpr, imageBytes, a);
+		}
 	}
 	if (decoded) free(decoded);
 	t->proxyDirty = true;
@@ -1205,7 +1257,14 @@ static Pipe *getPipeline(Shader *vs, Shader *ps, Layout *lay) {
 	State *blend = state(R->blendId);
 	const PassInfo &pi = R->passInfo;
 	uint64_t key = fnv(fnv(fnv(1469598103934665603ull, vs->info->uid), ps && ps->info ? ps->info->uid : 0), pi.key);
-	key = fnv(key, lay->oid);
+	key = fnv(key, layoutIdentity(lay));
+	// The bytecode shader identity does not subsume the native D3D input
+	// signature carried by each shader object; retain it in the PSO key.
+	key = fnv(key, vs->sig.size());
+	for (const Shader::Sig &signature : vs->sig) {
+		key = fnv(key, signature.sem); key = fnv(key, signature.idx);
+		key = fnv(key, signature.reg); key = fnv(key, signature.mask);
+	}
 	for (auto &s : lay->slots) { Buffer *b = buffer(R->vb[s.first].buf); key = fnv(key, b && b->buf ? R->vb[s.first].stride : 0xffffffffu); }
 	key = fnv(fnv(key, topologyClass(R->topo)), blend ? blend->hash : 0);
 	auto it = R->pipes.find(key);
@@ -1691,10 +1750,7 @@ static inline void traceDraw(const uint32_t *, Shader *, Shader *, Layout *, con
 static void capture(Texture *t, const std::string &name, id<MTLRenderPipelineState> pipe = nil, id<MTLTexture> second = nil);
 static void drawInner(const uint32_t *p);
 static const char *drawOutcome;
-static Shader *diagnosticDrawVS, *diagnosticDrawPS;
-static bool diagnosticShaderSwap;
 static void draw(const uint32_t *p) {
-	if (PGTDEnabled()) { diagnosticDrawVS = diagnosticDrawPS = nullptr; diagnosticShaderSwap = false; }
 	drawOutcome = "ok";
 	drawInner(p);
 #if MR_TRACE
@@ -1777,7 +1833,6 @@ static void drawInner(const uint32_t *p) {
 	bool maskSwap = minimapMaskSwap(vs, ps);
 	if (maskSwap != R->lastMaskSwap) { R->lastMaskSwap = maskSwap; R->pipeDirty = true; }
 	if (maskSwap) drawOutcome = "ok-maskswap";
-	if (PGTDEnabled()) { diagnosticDrawVS = vs; diagnosticDrawPS = ps; diagnosticShaderSwap = maskSwap; }
 	prepareProxies(vs->info, 0);
 	if (ps) prepareProxies(ps->info, 1);
 	if (!ensurePass()) { drawOutcome = "SKIP-norT"; R->skipped++; R->skipReasons[2]++; return; }
@@ -2452,6 +2507,9 @@ static void createLayout(const uint32_t *p) {
 		l->els.push_back(e);
 		if (e.slot < 16 && !((seen >> e.slot) & 1)) { seen |= 1u << e.slot; l->slots.push_back({e.slot, e.cls}); }
 	}
+	// CREATE_LAYOUT may replace an object without a preceding DESTROY packet.
+	layoutIdentityCache.forgetObject(p[0]);
+	(void)layoutIdentity(l);
 	R->objs.set(p[0], l);
 }
 static void createState(const uint32_t *p, uint32_t n) {
@@ -2479,6 +2537,7 @@ static void createQuery(const uint32_t *p) {
 static void destroyObject(uint32_t oid) {
 	Object *o = R->objs.get(oid);
 	if (!o) return;
+	if (o->kind == OLayout) layoutIdentityCache.forgetObject(oid);
 	if (o->kind == OBuffer) R->snapshotOwners.forget(oid);
 	if (o->kind == OTexture) {
 		R->depthProxyValidity.erase(oid);
@@ -2729,120 +2788,6 @@ static void report() {
 	for (;;) sleep(60);
 }
 
-// Diagnostic-only CPU metadata. No readback, extra GPU pass, game-memory mutation,
-// history reconstruction or screenshot. These are observed bindings, not verified
-// Temporal inputs; unknown/skipped/instanced paths remain explicitly distinguishable.
-static void temporalDiagnosticSample(const PGTDTag &tag, uint32_t op, const uint32_t *p,
-                                     uint32_t n, uint64_t drawsBefore) {
-	PGTDMetalSample s{}; s.tag = tag; s.opcode = op;
-	if (op == DRAW && n >= 6) {
-		s.drawKind = p[0]; s.indexCount = p[1]; s.instanceCount = p[2];
-		if (R->draws == drawsBefore) s.flags |= 4u; // no draw encoded, including zero-count early returns
-		if (p[2] != 1 || p[0] >= 2) s.flags |= 8u; // candidate entity is not per-instance identity
-		if (diagnosticShaderSwap) s.flags |= 64u;
-	}
-	Shader *vs = op == DRAW ? diagnosticDrawVS : R->objs.as<Shader>(R->shader[0], OShader);
-	Shader *ps = op == DRAW ? diagnosticDrawPS : R->objs.as<Shader>(R->shader[1], OShader);
-	auto noteShader = [](Shader *shader) -> uint32_t {
-		if (!shader) return 0;
-		uint32_t token = PGTDToken(100, shader->oid);
-		PGTDPlatformShader(token, shader->hash.c_str(), shader->info ? shader->info->label.c_str() : "");
-		return token;
-	};
-	s.vsToken = noteShader(vs); s.psToken = noteShader(ps);
-	if (vs && ps) s.flags |= 1u;
-	if (R->objs.as<Layout>(R->layout, OLayout)) s.layoutToken = PGTDToken(100, R->layout);
-	for (unsigned i = 0; i < 4; ++i) {
-		Texture *t = texture(R->rt[i].tex);
-		if (!t || !t->tex) continue;
-		s.colorToken[i] = PGTDToken(100, t->oid); s.colorFormat[i] = (uint32_t)t->format;
-		s.colorWidth[i] = (uint32_t)t->tex.width; s.colorHeight[i] = (uint32_t)t->tex.height;
-		s.colorSamples[i] = t->samples;
-		if (R->rt[i].mip || R->rt[i].slice || t->skip) s.flags |= 16u; // base-size comparison is insufficient
-	}
-	if (Texture *t = texture(R->ds.tex)) {
-		s.depthToken = PGTDToken(100, t->oid); s.depthFormat = (uint32_t)t->format;
-		s.depthWidth = t->tex ? (uint32_t)t->tex.width : 0; s.depthHeight = t->tex ? (uint32_t)t->tex.height : 0;
-		s.depthSamples = t->samples; s.depthMip = R->ds.mip; s.depthSlice = R->ds.slice;
-		if (R->ds.mip || R->ds.slice || t->skip) s.flags |= 16u;
-	}
-	if (op == PRESENT && n >= 1) if (Texture *t = texture(p[0])) {
-		s.presentedToken = PGTDToken(100, t->oid); s.presentedFormat = (uint32_t)t->format;
-		s.presentedWidth = t->tex ? (uint32_t)t->tex.width : 0; s.presentedHeight = t->tex ? (uint32_t)t->tex.height : 0;
-	}
-	std::copy_n(R->viewport, 4, s.viewport);
-	if (ps && ps->info) {
-		unsigned out = 0;
-		for (const auto &b : ps->info->res) {
-			if (out == 4) break;
-			if (b.kind != RTexture && b.kind != RTextureMS && b.kind != RDepth && b.kind != RDepthMS) continue;
-			if (b.binding < 32 || b.binding >= 160) continue;
-			View *v = view(R->srv[1][b.binding - 32], OSrv);
-			Texture *t = v && !v->isBuf ? texture(v->res) : nullptr;
-			if (!t || !t->tex) continue;
-			s.srvSlot[out] = b.binding - 32; s.srvToken[out] = PGTDToken(100, t->oid);
-			s.srvFormat[out] = (uint32_t)t->format; s.srvWidth[out] = (uint32_t)t->tex.width; s.srvHeight[out] = (uint32_t)t->tex.height;
-			// These are base resource dimensions/formats, not a created Metal SRV.
-			if (v->a || v->c || v->d || (v->b && v->b != UINT32_MAX) || v->fmt || t->skip || t->alphaView) s.flags |= 32u;
-			++out;
-		}
-	}
-	static const unsigned slots[4] = {1, 2, 3, 0};
-	for (unsigned i = 0; i < 4; ++i) {
-		const auto &c = R->cb[0][slots[i]];
-		Buffer *b = buffer(c.buf);
-		const uint64_t start = (uint64_t)c.first * 16;
-		if (!b || start >= b->shadow.size()) continue;
-		s.uniformToken[i] = PGTDToken(100, b->oid); s.uniformFirst[i] = c.first;
-		// Respect the actual reflected range when known; otherwise report a capped
-		// current-buffer prefix, not an asserted complete bone palette.
-		size_t bytes = std::min<size_t>(4096, b->shadow.size() - (size_t)start);
-		if (c.num) bytes = std::min<size_t>(bytes, (size_t)c.num * 16);
-		if (vs && vs->info) for (const auto &r : vs->info->res) if (r.kind == RUbo && r.binding == slots[i]) bytes = std::min<size_t>(bytes, r.size);
-		s.uniformBytes[i] = (uint32_t)bytes;
-		uint64_t hash = 14695981039346656037ull;
-		for (size_t j = 0; j < bytes; ++j) hash = fnv(hash, b->shadow[(size_t)start + j]);
-		s.uniformHash[i] = hash;
-		if (i == 0 && bytes >= 48 * sizeof(float)) {
-			memcpy(s.wvp, b->shadow.data() + start + 32 * sizeof(float), sizeof s.wvp);
-			bool valid = true; for (float value : s.wvp) valid &= std::isfinite(value);
-			if (valid) s.flags |= 2u; else memset(s.wvp, 0, sizeof s.wvp);
-		}
-	}
-	if (PGTDProbeRequested()) {
-		PGTDProbeDrawState probe{};
-		Texture *depth = texture(R->ds.tex);
-		probe.depth = depth ? depth->tex : nil;
-		if (State *dss = state(R->dssId)) if (dss->words.size() >= 13 && dss->words[0]) {
-			probe.depthWrite = dss->words[1] == 1 && !R->passInfo.roDepth;
-			if (dss->words[2] >= 1 && dss->words[2] <= 8) probe.depthCompare = dss->words[2] - 1;
-		}
-		probe.fullViewport = R->hasViewport && R->viewport[0] == 0 && R->viewport[1] == 0 &&
-			R->viewport[2] == tag.camera.width && R->viewport[3] == tag.camera.height &&
-			R->viewport[4] == 0 && R->viewport[5] == 1;
-		// Pinned WGSL verified these exact shader variants' world rows and WVP.
-		// Static tire and arbitrary similarly named variants are NOT assumed equal.
-		const bool verifiedLayout = vs && (vs->hash == "6a6a0898a51cf403" ||
-			vs->hash == "134025f0da917112" || vs->hash == "2411632420e981ff" ||
-			vs->hash == "f524dc3c430c8361");
-		if (op == DRAW && verifiedLayout && s.uniformBytes[0] >= 192) {
-			const auto &binding = R->cb[0][1];
-			Buffer *b = buffer(binding.buf);
-			const size_t offset = (size_t)binding.first * 16;
-			if (b && offset <= b->shadow.size() && b->shadow.size() - offset >= 192) {
-				float rows[16]; memcpy(rows, b->shadow.data() + offset, sizeof rows);
-				for (unsigned row = 0; row < 4; ++row) {
-					for (unsigned col = 0; col < 3; ++col) probe.worldRows[row * 4 + col] = rows[row * 4 + col];
-					probe.worldRows[row * 4 + 3] = row == 3 ? 1.f : 0.f;
-				}
-				probe.worldKnown = true;
-			}
-		}
-		PGTDProbeObserveSample(s, probe);
-	}
-	PGTDRecordMetal(&s);
-}
-
 static void loop() {
 	auto *hdr = (std::atomic<uint32_t> *)(R->mem + R->ring);
 	uint32_t tail = RING_DATA;
@@ -2874,32 +2819,7 @@ static void loop() {
 				uint32_t op = base[0], n = base[1];
 				if (op == WRAP) { tail = RING_DATA; continue; }
 				if (n > (R->ringSize - tail - 8) / 4 || (tail < head && tail + 8 + n * 4 > head)) ringFault(op, n, tail, head);
-				PGTDTag diagnosticTag; // only populated on a matched active sample
-				const bool diagnostics = PGTDEnabled() != 0;
-				const bool sampled = diagnostics && (op == DRAW || op == PRESENT || op == SET_RENDER_TARGETS) &&
-					PGTDConsumePacket(R->ring + tail, op, n, &diagnosticTag);
-				// Object IDs may be recycled. A create/destroy breaks diagnostic identity,
-				// including replacements that did not have a separate destroy packet.
-				if (diagnostics && n && (op == DESTROY_OBJECT || op == CREATE_TEXTURE || op == CREATE_BUFFER ||
-				    op == CREATE_SHADER || op == CREATE_LAYOUT || op == CREATE_STATE || op == CREATE_SRV || op == CREATE_UAV || op == CREATE_QUERY))
-					PGTDForgetToken(100, base[2]);
-				const uint64_t drawsBefore = sampled ? R->draws : 0;
-					if (PGTDProbeRequested()) {
-						if (n && (op == CLEAR_DS || op == DESTROY_OBJECT || op == CREATE_TEXTURE))
-							if (Texture *t = texture(base[2])) PGTDProbeInvalidateDepth(t->tex);
-						if (sampled && PGTDProbeNeedsBoundary(diagnosticTag, op)) {
-							// Stage105 marks entry to UI binding, not completed UI color.
-							// Store the previous scene pass and probe its retained depth.
-							endEncoders();
-							PGTDProbeEncodeBoundary(commandBuffer(), diagnosticTag);
-						}
-					}
 				execute(op, base + 2, n);
-				if (sampled) temporalDiagnosticSample(diagnosticTag, op, base + 2, n, drawsBefore);
-					if (op == PRESENT) {
-						PGTDProbeSourcePresent();
-						PGTDPlatformFrame(); // source PRESENTs, not display refreshes
-					}
 				tail += n * 4 + 8;
 				executed++;
 				if (++sinceYield >= 512) {

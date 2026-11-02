@@ -120,14 +120,13 @@ targets:
           NSAllowsArbitraryLoads: true
         # Filled in by the cloud build so you don't have to type it.
         PGDefaultAssetServer: ""
-        PGDiagnosticBuildSHA: "unknown"
         # The Lite build for iPhones with little memory (build_ipa.sh --lite).
         PGLiteMode: false
         # The app folder (logs) is visible in the Files app.
         UIFileSharingEnabled: true
         LSSupportsOpeningDocumentsInPlace: true
-        CFBundleVersion: "23"
-        PGCustomBuildLabel: "MetalFX Super Resolution + Stability"
+        CFBundleVersion: "24"
+        PGCustomBuildLabel: "MetalFX Spatial + Streaming + Audio"
         PGEngineRequiresLSE: true
         PGEngineCodegen: "apple-a11 / tune apple-a17 / LSE"
         UILaunchScreen: {}

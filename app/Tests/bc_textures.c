@@ -18,25 +18,70 @@ static void check(int format,uint32_t width,uint32_t height,uint32_t depth,int p
  void *old=PGDecodeBCReference(format,width,height,depth,pitch,rows,source,size,&oldSize);
  void *fresh=PGDecodeBC(format,width,height,depth,pitch,rows,source,size,&newSize);
  assert(old&&fresh&&oldSize==newSize&&!memcmp(old,fresh,newSize));free(old);free(fresh);
+ size_t layoutSize=0;assert(PGDecodeBCOutputSize(format,width,height,depth,pitch,rows,source,size,&layoutSize)&&layoutSize==oldSize);
+ old=PGDecodeBCReference(format,width,height,depth,pitch,rows,source,size,&oldSize);
+ uint8_t *direct=malloc(oldSize+8);assert(direct);memset(direct,0xa7,oldSize+8);newSize=123;
+ assert(PGDecodeBCInto(format,width,height,depth,pitch,rows,source,size,direct,oldSize,&newSize));
+ assert(newSize==oldSize&&!memcmp(old,direct,newSize));for(size_t i=oldSize;i<oldSize+8;i++)assert(direct[i]==0xa7);
+ memset(direct,0xa7,oldSize+8);newSize=123;
+ assert(!PGDecodeBCInto(format,width,height,depth,pitch,rows,source,size,direct,oldSize-1,&newSize)&&newSize==0);
+ for(size_t i=0;i<oldSize+8;i++)assert(direct[i]==0xa7);
+ free(old);free(direct);
  size_t last=(size_t)(depth-1)*slice+(by-1)*pitch+bx*blockBytes;
  // The exact final block is accepted; removing its final byte is rejected.
  old=PGDecodeBCReference(format,width,height,depth,pitch,0,source,last-1,&oldSize);
  fresh=PGDecodeBC(format,width,height,depth,pitch,0,source,last-1,&newSize);
- assert((old==NULL)==(fresh==NULL));if(old){assert(oldSize==newSize&&!memcmp(old,fresh,newSize));}
+ assert((old==NULL)==(fresh==NULL));layoutSize=123;
+ int layoutOK=PGDecodeBCOutputSize(format,width,height,depth,pitch,0,source,last-1,&layoutSize);
+ assert(layoutOK==(old!=NULL));if(old){assert(oldSize==newSize&&layoutSize==newSize&&!memcmp(old,fresh,newSize));}else assert(layoutSize==0);
  free(old);free(fresh);free(allocation);countCases++;
 }
 static double now(void){struct timespec t;clock_gettime(CLOCK_MONOTONIC,&t);return t.tv_sec+t.tv_nsec*1e-9;}
 static double measure(int format,uint32_t dim,int reference,const void *source,size_t size){
- double results[7];volatile uint8_t checkSum=0;
+ size_t pixelBytes=format==4?1:format==5?2:format==6?8:4,capacity=(size_t)dim*dim*pixelBytes;
+ uint8_t *stage=malloc(capacity);assert(stage);double results[7];volatile uint8_t checkSum=0;
  for(int trial=0;trial<7;trial++){
-  double start=now();for(int i=0;i<12;i++){size_t outSize=0;uint8_t *out=(reference?PGDecodeBCReference:PGDecodeBC)(format,dim,dim,1,0,0,source,size,&outSize);assert(out);checkSum^=out[outSize/2];free(out);}
+  double start=now();for(int i=0;i<12;i++){size_t outSize=0;uint8_t *out=(reference?PGDecodeBCReference:PGDecodeBC)(format,dim,dim,1,0,0,source,size,&outSize);assert(out&&outSize==capacity);memcpy(stage,out,outSize);checkSum^=stage[outSize/2];free(out);}
   results[trial]=(now()-start)*1000/12;
  }
  for(int i=0;i<7;i++)for(int j=i+1;j<7;j++)if(results[j]<results[i]){double v=results[i];results[i]=results[j];results[j]=v;}
- return results[3]+checkSum*0.0;
+ free(stage);return results[3]+checkSum*0.0;
+}
+static double measureInto(int format,uint32_t dim,const void *source,size_t size){
+ size_t pixelBytes=format==4?1:format==5?2:format==6?8:4,capacity=(size_t)dim*dim*pixelBytes;
+ uint8_t *out=malloc(capacity);assert(out);double results[7];volatile uint8_t checkSum=0;
+ for(int trial=0;trial<7;trial++){
+  double start=now();for(int i=0;i<12;i++){size_t outSize=0;assert(PGDecodeBCInto(format,dim,dim,1,0,0,source,size,out,capacity,&outSize));assert(outSize==capacity);checkSum^=out[outSize/2];}
+  results[trial]=(now()-start)*1000/12;
+ }
+ for(int i=0;i<7;i++)for(int j=i+1;j<7;j++)if(results[j]<results[i]){double v=results[i];results[i]=results[j];results[j]=v;}
+ free(out);return results[3]+checkSum*0.0;
+}
+static void checkDefaultRowPitch(void){
+ // Exercise multiple block rows and images: zero rowPitch must be normalized
+ // once by the layout and used for every source row, not just sizing.
+ const uint32_t width=9,height=11,depth=3,bx=(width+3)/4,by=(height+3)/4;
+ for(int format=1;format<=7;format++){
+  size_t blockBytes=(format==1||format==4)?8:16;
+  uint32_t normalizedPitch=(uint32_t)(bx*blockBytes);
+  size_t sourceSize=(size_t)normalizedPitch*by*depth;
+  uint8_t *source=malloc(sourceSize);assert(source);
+  for(size_t i=0;i<sourceSize;i++)source[i]=(uint8_t)random32();
+  size_t expectedSize=0,actualSize=0;
+  void *expected=PGDecodeBCReference(format,width,height,depth,0,0,source,sourceSize,&expectedSize);
+  assert(expected);
+  uint8_t *direct=malloc(expectedSize);assert(direct);
+  assert(PGDecodeBCInto(format,width,height,depth,0,0,source,sourceSize,direct,expectedSize,&actualSize));
+  assert(actualSize==expectedSize&&!memcmp(expected,direct,expectedSize));
+  size_t explicitSize=0;
+  void *explicitPitch=PGDecodeBC(format,width,height,depth,normalizedPitch,0,source,sourceSize,&explicitSize);
+  assert(explicitPitch&&explicitSize==expectedSize&&!memcmp(expected,explicitPitch,expectedSize));
+  free(explicitPitch);free(direct);free(expected);free(source);
+ }
 }
 int main(void){
  uint32_t dims[]={1,2,3,4,5,7,8,15,16,17,31,32,33,63,64,65};
+ checkDefaultRowPitch();
  for(int format=1;format<=7;format++)for(size_t i=0;i<sizeof(dims)/sizeof(dims[0]);i++)for(int padded=0;padded<2;padded++)for(uint32_t depth=1;depth<=3;depth++)check(format,dims[i],dims[(i*7+3)%16],depth,padded,0);
  for(int format=1;format<=7;format++)for(int i=0;i<100;i++)check(format,1+random32()%80,1+random32()%80,1+random32()%3,i%2,i%3==0);
  uint8_t block[16]={0};size_t size=123;
@@ -51,8 +96,8 @@ int main(void){
   for(int f=1;f<=7;f++)for(uint32_t dim=256;dim<=1024;dim*=2){
    size_t sourceSize=(size_t)dim*dim*(f==1||f==4?8:16)/16;uint8_t *source=malloc(sourceSize);
    for(size_t i=0;i<sourceSize;i++)source[i]=random32();
-   double old=measure(f,dim,1,source,sourceSize),fresh=measure(f,dim,0,source,sourceSize);
-   printf("BC%d %ux%u: original %.3f ms, direct %.3f ms, speedup %.3fx\n",f,dim,dim,old,fresh,old/fresh);free(source);
+   double old=measure(f,dim,1,source,sourceSize),fresh=measure(f,dim,0,source,sourceSize),reused=measureInto(f,dim,source,sourceSize);
+   printf("BC%d %ux%u staging: reference decoder + copy %.3f ms, allocating decoder + copy %.3f ms, direct into ring %.3f ms\n",f,dim,dim,old,fresh,reused);free(source);
   }
  }
  return 0;

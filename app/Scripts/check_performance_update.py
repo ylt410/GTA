@@ -13,15 +13,6 @@ def run(args):
     print('+ ' + ' '.join(map(str, args)), flush=True)
     subprocess.run(list(map(str, args)), cwd=ROOT, check=True)
 
-def run_metal_test(args):
-    print('+ ' + ' '.join(map(str, args)), flush=True)
-    result = subprocess.run(list(map(str, args)), cwd=ROOT, check=False)
-    if result.returncode == 77:
-        print('SKIP: no Metal device; Objective-C++ compilation still ran.', flush=True)
-        return
-    if result.returncode != 0:
-        raise subprocess.CalledProcessError(result.returncode, args)
-
 def main():
     cc = os.environ.get('CC') or shutil.which('cc')
     cxx = os.environ.get('CXX') or shutil.which('c++')
@@ -29,6 +20,8 @@ def main():
         raise SystemExit('A C and C++ compiler are required for the preflight.')
     tests = [
         ('native_log_filter', cc, 'c11', 'Tests/native_log_filter.c'),
+        ('audio_decoder_cache', cc, 'c11', 'Tests/audio_decoder_cache.c'),
+        ('audio_continuity', cc, 'c11', 'Tests/audio_continuity.c'),
         ('spatial_upscale_policy', cxx, 'c++17', 'Tests/spatial_upscale_policy.cpp'),
         ('memory_budget', cc, 'c11', 'Tests/memory_budget.c'),
         ('engine_configuration', cc, 'c11', 'Tests/engine_configuration.c'),
@@ -37,6 +30,8 @@ def main():
         ('local_asset_reader', cc, 'c11', 'Tests/local_asset_reader.c'),
         ('metal_immediate_cache', cxx, 'c++17', 'Tests/metal_immediate_cache.cpp'),
         ('metal_binding_plan', cxx, 'c++17', 'Tests/metal_binding_plan.cpp'),
+        ('metal_layout_identity', cxx, 'c++17', 'Tests/metal_layout_identity.cpp'),
+        ('texture_upload_policy', cxx, 'c++17', 'Tests/texture_upload_policy.cpp'),
         ('constant_upload', cxx, 'c++17', 'Tests/metal_constant_upload.cpp'),
         ('render_target_cache', cxx, 'c++17', 'Tests/metal_render_target_cache.cpp'),
         ('upload_ring_retention', cxx, 'c++20', 'Tests/upload_ring_retention.cpp'),
@@ -59,25 +54,27 @@ def main():
             run([compiler, '-std='+standard, feature, '-O2', '-Wall', '-Wextra',
                  '-pthread', '-I', 'Source', source, '-o', target])
             run([target])
+        # Exercise ASTC transcoding and BC decoding as native host code. The
+        # decoder runner obtains the exact pinned bcdec header in its temp tree
+        # when prepare.py has not populated Tools yet; CC is deliberately not
+        # inherited here, so this is not accidentally an iOS cross-build.
+        native_cc = shutil.which('cc')
+        if not native_cc:
+            raise SystemExit('A native host C compiler is required for BC texture preflight.')
+        astc = Path(work) / 'bc-astc-into'
+        feature = '-D_DARWIN_C_SOURCE' if platform.system() == 'Darwin' else '-D_POSIX_C_SOURCE=200809L'
+        run([native_cc, '-std=c11', feature, '-O2', '-Wall', '-Wextra', '-Werror',
+             'Tests/bc_astc_into.c', 'Source/BC1ToASTC.c', '-o', astc])
+        run([astc])
+        run([shutil.which('python3') or 'python3', 'Tests/bc_texture_production.py'])
         run([shutil.which('python3') or 'python3', 'Tests/precompiled_shaders.py'])
         # Exercise the actual production CPU paths without requiring a Metal
         # device; SDK compilation still runs below in the macOS build job.
         run([shutil.which('python3') or 'python3', 'Tests/archive_production.py'])
         run([shutil.which('python3') or 'python3', 'Tests/compressed_shadow_production.py'])
-        temporal = Path(work) / 'temporal-diagnostics'
-        run([cxx, '-std=c++17', '-O2', '-Wall', '-Wextra', '-Werror', '-pthread',
-             'Source/NativeTemporalDiagnostics.cpp', 'Tests/temporal_diagnostics.cpp', '-o', temporal])
-        run([temporal])
-        reprojection = Path(work) / 'temporal-reprojection'
-        run([cxx, '-std=c++17', '-O2', '-Wall', '-Wextra', '-Werror', '-pthread',
-             'Tests/temporal_reprojection.cpp', '-o', reprojection])
-        run([reprojection])
-        bridge = Path(work) / 'temporal-engine-bridge'
-        run([cc, '-std=c11', '-O2', '-Wall', '-Wextra', '-Werror', '-I', 'Source',
-             'Tests/temporal_engine_bridge.c', '-lm', '-o', bridge])
-        run([bridge])
-        run([shutil.which('python3') or 'python3', 'Tests/temporal_diagnostics_patch.py'])
-        run([shutil.which('python3') or 'python3', 'Tests/temporal_report_analysis.py'])
+        run([shutil.which('python3') or 'python3', 'Tests/asset_worker_production.py'])
+        run([shutil.which('python3') or 'python3', 'Tests/native_opus_production.py'])
+        run([shutil.which('python3') or 'python3', 'Tests/no_temporal_probe.py'])
         futex = Path(work) / 'futex-waits'
         feature = '-D_DARWIN_C_SOURCE' if platform.system() == 'Darwin' else '-D_GNU_SOURCE'
         run([cc, '-std=c11', feature, '-O2', '-Wall', '-Wextra', '-Werror', '-pthread', '-DPG_FUTEX_TESTING',
@@ -95,6 +92,7 @@ def main():
             swift = shutil.which('swiftc')
             if not swift:
                 raise SystemExit('Swift compiler required for the iOS preflight.')
+            run(['bash', 'Tests/run_bike_input_axes.sh'])
             target = Path(work) / 'cache-maintenance'
             run([swift, '-parse-as-library', 'App/CacheMaintenance.swift',
                  'Tests/cache_maintenance.swift', '-o', target])
@@ -102,6 +100,21 @@ def main():
             # Parse every app file before spending time generating/compiling
             # the engine; UIKit/API type checking remains in the real SDK build.
             run([swift, '-frontend', '-parse', *sorted(ROOT.glob('App/**/*.swift'))])
+            simulator_sdk = subprocess.check_output(
+                ['xcrun', '--sdk', 'iphonesimulator', '--show-sdk-path'], text=True).strip()
+            # Type-check the production touch controls with the engine stubs and
+            # regression scenario. Keep this in preflight so the harness can't
+            # silently drift out of sync with PGControlHints or production APIs.
+            # Concatenate the harness with its source so its extension can inspect
+            # TouchControlsView's private state, as the simulator runner does.
+            controls_harness = Path(work) / 'touch-controls-regression.swift'
+            controls_harness.write_text(
+                (ROOT / 'App/TouchControlsView.swift').read_text() + '\n' +
+                (ROOT / 'Tests/airplane_controls.swift').read_text())
+            run([swift, '-typecheck', '-parse-as-library', '-swift-version', '5',
+                 '-module-name', 'TouchControlsRegression', '-target', 'arm64-apple-ios16.0-simulator',
+                 '-sdk', simulator_sdk, str(controls_harness), 'App/VirtualPad.swift',
+                 'App/BikeInputAxes.swift'])
             sdk = subprocess.check_output(['xcrun', '--sdk', 'iphoneos', '--show-sdk-path'], text=True).strip()
             run([swift, '-typecheck', '-parse-as-library', '-swift-version', '5',
                  '-module-name', 'PlayGTA5Native', '-target', 'arm64-apple-ios16.0', '-sdk', sdk,
@@ -113,18 +126,6 @@ def main():
             run(['xcrun', '--sdk', 'iphoneos', 'clang++', '-fsyntax-only', '-std=c++20',
                  '-fobjc-arc', '-fblocks', '-target', 'arm64-apple-ios16.0', '-isysroot', sdk,
                  '-I', 'Source', 'Source/MetalRenderer/MRFrameReports.mm'])
-            run(['xcrun', '--sdk', 'iphoneos', 'clang++', '-fsyntax-only', '-std=c++20',
-                 '-fobjc-arc', '-fblocks', '-target', 'arm64-apple-ios16.0', '-isysroot', sdk,
-                 '-I', 'Source', 'Source/NativeTemporalDiagnosticsPlatform.mm'])
-            run(['xcrun', '--sdk', 'iphoneos', 'clang++', '-fsyntax-only', '-std=c++20',
-                 '-fobjc-arc', '-fblocks', '-target', 'arm64-apple-ios16.0', '-isysroot', sdk,
-                 '-I', 'Source', 'Source/NativeTemporalCameraProbe.mm'])
-            probe_test = Path(work) / 'temporal-camera-probe'
-            run([cxx, '-std=c++20', '-O2', '-Wall', '-Wextra', '-fobjc-arc', '-fblocks', '-pthread',
-                 '-I', 'Source', 'Source/NativeTemporalCameraProbe.mm',
-                 'Tests/temporal_camera_probe.mm', '-framework', 'Foundation', '-framework', 'Metal',
-                 '-o', probe_test])
-            run_metal_test([probe_test])
         else:
             print('Swift/UIKit checks deferred to the same macOS build job.', flush=True)
     print('Performance/cache preflight passed.', flush=True)

@@ -16,6 +16,14 @@ void *PGTranscodeBC1ToASTC(uint32_t w, uint32_t h, uint32_t d, uint32_t bpr, uin
 // The same for BC1 (kind 1) or BC3 (kind 3) blocks.
 void *PGTranscodeBCToASTC(int kind, uint32_t w, uint32_t h, uint32_t d, uint32_t bpr, uint32_t rpi, const void *data, size_t size,
                           size_t *outSize, uint32_t *outBpr, uint32_t *outRpi);
+// Validate a compressed region and report the tightly packed ASTC output layout.
+// No allocation or destination writes occur.
+int PGTranscodeBCToASTCOutputSize(int kind,uint32_t w,uint32_t h,uint32_t d,uint32_t bpr,uint32_t rpi,const void *data,size_t size,
+                                  size_t *outSize,uint32_t *outBpr,uint32_t *outRpi);
+// Caller-owned variant of the region transcode. The destination receives
+// tightly packed ASTC blocks; all outputs are zeroed on failure.
+int PGTranscodeBCToASTCInto(int kind, uint32_t w, uint32_t h, uint32_t d, uint32_t bpr, uint32_t rpi, const void *data, size_t size,
+                            void *destination, size_t destinationCapacity, size_t *outSize, uint32_t *outBpr, uint32_t *outRpi);
 #ifdef __cplusplus
 }
 #endif

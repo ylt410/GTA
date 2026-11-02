@@ -10,6 +10,7 @@ mkdir "$APP"
 cat "$APP_ROOT/App/TouchControlsView.swift" "$APP_ROOT/Tests/airplane_controls.swift" > "$WORK/Checks.swift"
 xcrun swiftc -sdk "$(xcrun --sdk iphonesimulator --show-sdk-path)" \
   -target arm64-apple-ios16.0-simulator "$WORK/Checks.swift" "$APP_ROOT/App/VirtualPad.swift" \
+  "$APP_ROOT/App/BikeInputAxes.swift" \
   -framework UIKit -framework GameController -o "$APP/ControlsChecks"
 /usr/bin/python3 - "$APP/Info.plist" <<'PY'
 import plistlib, sys

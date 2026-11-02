@@ -12,6 +12,34 @@
 #include <stdlib.h>
 #include <string.h>
 
+static const size_t kMaxASTCOutputBytes = 256u * 1024u * 1024u;
+
+static uint32_t reverseBits32(uint32_t x) {
+#if defined(__has_builtin)
+#if __has_builtin(__builtin_bitreverse32)
+	return __builtin_bitreverse32(x);
+#endif
+#endif
+	x = (x >> 1 & 0x55555555u) | (x & 0x55555555u) << 1;
+	x = (x >> 2 & 0x33333333u) | (x & 0x33333333u) << 2;
+	x = (x >> 4 & 0x0f0f0f0fu) | (x & 0x0f0f0f0fu) << 4;
+	x = (x >> 8 & 0x00ff00ffu) | (x & 0x00ff00ffu) << 8;
+	return x >> 16 | x << 16;
+}
+static uint64_t reverseBits64(uint64_t x) {
+#if defined(__has_builtin)
+#if __has_builtin(__builtin_bitreverse64)
+	return __builtin_bitreverse64(x);
+#endif
+#endif
+	x = (x >> 1 & UINT64_C(0x5555555555555555)) | (x & UINT64_C(0x5555555555555555)) << 1;
+	x = (x >> 2 & UINT64_C(0x3333333333333333)) | (x & UINT64_C(0x3333333333333333)) << 2;
+	x = (x >> 4 & UINT64_C(0x0f0f0f0f0f0f0f0f)) | (x & UINT64_C(0x0f0f0f0f0f0f0f0f)) << 4;
+	x = (x >> 8 & UINT64_C(0x00ff00ff00ff00ff)) | (x & UINT64_C(0x00ff00ff00ff00ff)) << 8;
+	x = (x >> 16 & UINT64_C(0x0000ffff0000ffff)) | (x & UINT64_C(0x0000ffff0000ffff)) << 16;
+	return x >> 32 | x << 32;
+}
+
 // The ASTC integer sequence for trits: five values in 8 bits. Built once by running the spec's decoder
 // over every 8-bit pattern and keeping the first pattern for each combination.
 static uint8_t tritPack[243];
@@ -44,7 +72,7 @@ static unsigned __int128 tritWeights(const uint8_t *w, unsigned count) {
 		stream |= (uint64_t)(tritPack[key] & ((1u << bitsFor[n]) - 1)) << bit;
 		bit += bitsFor[n];
 	}
-	return (unsigned __int128)__builtin_bitreverse64(stream) << 64;		// stream bit i lands on block bit 127 - i
+	return (unsigned __int128)reverseBits64(stream) << 64;		// stream bit i lands on block bit 127 - i
 }
 
 static uint8_t quant7(unsigned v8) {		// best 7-bit endpoint: decodes as v << 1 | v >> 6
@@ -76,7 +104,7 @@ void PGBC1BlockToASTC(const uint8_t bc1[8], uint8_t astc[16]) {
 		// texel i sits at bit 127 - (2i + k), which is the 32-bit index word reversed into the top 32 bits.
 		uint32_t weights = ((indices ^ indices >> 1) & 0x55555555u) | (indices << 1 & 0xAAAAAAAAu);
 		if (swap) weights = ~weights;
-		v |= (unsigned __int128)__builtin_bitreverse32(weights) << 96;
+		v |= (unsigned __int128)reverseBits32(weights) << 96;
 		memcpy(astc, &v, 16);		// little-endian: bit n of v is bit n of the block
 		return;
 	}
@@ -187,7 +215,7 @@ void PGBC3BlockToASTC(const uint8_t bc3[16], uint8_t astc[16]) {
 		for (unsigned k = 0; k < 3; k++) v |= (unsigned __int128)(e[swap][k] | e[!swap][k] << 8) << (17 + 16 * k);
 		v |= (unsigned __int128)(aMin | aMin << 8) << (17 + 48);
 		if (swap) weights = ~weights;
-		v |= (unsigned __int128)__builtin_bitreverse32(weights) << 96;
+		v |= (unsigned __int128)reverseBits32(weights) << 96;
 		memcpy(astc, &v, 16);
 		return;
 	}
@@ -231,7 +259,7 @@ void PGBC3BlockToASTC(const uint8_t bc3[16], uint8_t astc[16]) {
 	v |= pack48(q);
 	uint64_t stream = 0;
 	for (unsigned i = 0; i < 16; i++) stream |= (uint64_t)w[i] << 4 * i | (uint64_t)aw[i] << (4 * i + 2);
-	v |= (unsigned __int128)__builtin_bitreverse64(stream) << 64;
+	v |= (unsigned __int128)reverseBits64(stream) << 64;
 	v |= (unsigned __int128)3 << 62;
 	memcpy(astc, &v, 16);
 }
@@ -243,19 +271,60 @@ void *PGTranscodeBC1ToASTC(uint32_t w, uint32_t h, uint32_t d, uint32_t bpr, uin
 
 void *PGTranscodeBCToASTC(int kind, uint32_t w, uint32_t h, uint32_t d, uint32_t bpr, uint32_t rpi, const void *data, size_t size,
                           size_t *outSize, uint32_t *outBpr, uint32_t *outRpi) {
-	if (kind != 1 && kind != 3) return NULL;
-	const size_t blockBytes = kind == 1 ? 8 : 16;
-	uint32_t bw = (w + 3) / 4, bh = (h + 3) / 4, imageRows = rpi ? rpi : bh;
-	size_t pitch = (size_t)bw * 16, image = pitch * bh;
-	if ((size_t)bw * blockBytes > bpr || (size_t)bpr * imageRows * (d - 1) + (size_t)bpr * bh > size) return NULL;
-	uint8_t *out = malloc(image * d);
+	if (outSize) *outSize = 0;
+	if (outBpr) *outBpr = 0;
+	if (outRpi) *outRpi = 0;
+	size_t capacity = 0; uint32_t outputBpr = 0, outputRows = 0;
+	if (!outSize || !outBpr || !outRpi || !PGTranscodeBCToASTCOutputSize(kind,w,h,d,bpr,rpi,data,size,&capacity,&outputBpr,&outputRows)) return NULL;
+	uint8_t *out = malloc(capacity);
 	if (!out) return NULL;
+	if (!PGTranscodeBCToASTCInto(kind,w,h,d,bpr,rpi,data,size,out,capacity,outSize,outBpr,outRpi)) { free(out); return NULL; }
+	return out;
+}
+
+int PGTranscodeBCToASTCOutputSize(int kind,uint32_t w,uint32_t h,uint32_t d,uint32_t bpr,uint32_t rpi,const void *data,size_t size,
+                                  size_t *outSize,uint32_t *outBpr,uint32_t *outRpi) {
+	if (outSize) *outSize = 0;
+	if (outBpr) *outBpr = 0;
+	if (outRpi) *outRpi = 0;
+	if ((kind != 1 && kind != 3) || !w || !h || !d || !data || !outSize || !outBpr || !outRpi) return 0;
+	const size_t blockBytes = kind == 1 ? 8 : 16;
+	uint32_t bw = w / 4 + (w % 4 != 0), bh = h / 4 + (h % 4 != 0), imageRows = rpi ? rpi : bh;
+	if (bw && SIZE_MAX / (size_t)bw < 16) return 0;
+	size_t pitch = (size_t)bw * 16;
+	if (pitch > UINT32_MAX || (size_t)bh > SIZE_MAX / pitch) return 0;
+	size_t image = pitch * bh;
+	if ((size_t)d > SIZE_MAX / image) return 0;
+	size_t outputBytes = image * d;
+	if (outputBytes > kMaxASTCOutputBytes) return 0;
+	if ((bw && SIZE_MAX / (size_t)bw < blockBytes) || (size_t)bw * blockBytes > bpr || imageRows < bh ||
+	    (size_t)bpr > SIZE_MAX / imageRows || (size_t)bpr > SIZE_MAX / bh) return 0;
+	size_t sourceSlice = (size_t)bpr * imageRows;
+	if ((size_t)(d - 1) > SIZE_MAX / sourceSlice) return 0;
+	size_t precedingSlices = sourceSlice * (d - 1), lastImageBytes = (size_t)bpr * bh;
+	if (precedingSlices > size || lastImageBytes > size - precedingSlices) return 0;
+	*outSize = outputBytes; *outBpr = (uint32_t)pitch; *outRpi = bh;
+	return 1;
+}
+
+int PGTranscodeBCToASTCInto(int kind, uint32_t w, uint32_t h, uint32_t d, uint32_t bpr, uint32_t rpi, const void *data, size_t size,
+                            void *destination, size_t destinationCapacity, size_t *outSize, uint32_t *outBpr, uint32_t *outRpi) {
+	if (outSize) *outSize = 0;
+	if (outBpr) *outBpr = 0;
+	if (outRpi) *outRpi = 0;
+	if (!destination || !outSize || !outBpr || !outRpi) return 0;
+	size_t outputBytes = 0; uint32_t pitch32 = 0, bh = 0;
+	if (!PGTranscodeBCToASTCOutputSize(kind,w,h,d,bpr,rpi,data,size,&outputBytes,&pitch32,&bh) || destinationCapacity < outputBytes) return 0;
+	uint32_t bw = w / 4 + (w % 4 != 0);
+	size_t pitch = pitch32, image = pitch * bh;
+	uint32_t imageRows = rpi ? rpi : bh;
+	size_t sourceSlice = (size_t)bpr * imageRows;
 	for (uint32_t z = 0; z < d; z++) for (uint32_t y = 0; y < bh; y++) {
-		const uint8_t *row = (const uint8_t *)data + (size_t)z * bpr * imageRows + (size_t)y * bpr;
-		uint8_t *to = out + z * image + y * pitch;
+		const uint8_t *row = (const uint8_t *)data + (size_t)z * sourceSlice + (size_t)y * bpr;
+		uint8_t *to = (uint8_t *)destination + (size_t)z * image + (size_t)y * pitch;
 		if (kind == 1) for (uint32_t x = 0; x < bw; x++) PGBC1BlockToASTC(row + 8 * x, to + 16 * x);
 		else for (uint32_t x = 0; x < bw; x++) PGBC3BlockToASTC(row + 16 * x, to + 16 * x);
 	}
-	*outSize = image * d; *outBpr = (uint32_t)pitch; *outRpi = bh;
-	return out;
+	*outSize = outputBytes; *outBpr = pitch32; *outRpi = bh;
+	return 1;
 }

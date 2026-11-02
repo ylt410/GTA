@@ -184,9 +184,15 @@ final class FloatingStick: UIView {
     var travel: CGFloat = 48
     private(set) var origin = CGPoint.zero
     private(set) var value = CGPoint.zero
+    /// Independent vertical deflection for a bike's lean axis. Unlike `value.y`
+    /// this doesn't fall when a circular stick is moved sideways to steer.
+    private(set) var verticalValue: CGFloat = 0
     #if targetEnvironment(simulator)
     /// Automation: a held stick without a finger (--test-touch-sprint).
-    func testHold(_ point: CGPoint?) { value = point ?? .zero }
+    func testHold(_ point: CGPoint?) {
+        value = point ?? .zero
+        verticalValue = point?.y ?? 0
+    }
     #endif
     private var engaged = false
     var idleOrigin: CGPoint? { didSet { if !engaged { showIdle() } } }
@@ -218,6 +224,7 @@ final class FloatingStick: UIView {
         engaged = true
         origin = point
         value = .zero
+        verticalValue = 0
         layoutParts()
         UIView.animate(withDuration: 0.08) { self.alpha = 1 }
     }
@@ -227,11 +234,13 @@ final class FloatingStick: UIView {
         let dx = point.x - origin.x, dy = horizontalOnly ? 0 : point.y - origin.y
         let length = max(1, hypot(dx, dy) / travel)
         value = CGPoint(x: dx / travel / length, y: -dy / travel / length)
+        verticalValue = CGFloat(BikeInputAxes.independentAxis(displacement: Double(-dy), travel: Double(travel)))
         layoutParts()
     }
     func end() {
         engaged = false
         value = .zero
+        verticalValue = 0
         sprinting = false
         UIView.animate(withDuration: 0.15) { self.showIdle() }
     }
@@ -1053,12 +1062,16 @@ final class TouchControlsView: UIView {
             if !has(isPlaneStick) { roles[id] = .planeStick; rightStick.begin(at: point) }
         } else if context.flying, leftZone {
             if !has(isStick) { roles[id] = .moveStick; moveStick.begin(at: point) }
-        } else if leftZone, context.driving, GameSettings.shared.steeringButtons {
-            // Steering buttons replace the steering stick; the rest of the left side does nothing.
+        } else if leftZone, context.driving, GameSettings.shared.steeringButtons,
+                  context != .bike, context != .bicycle {
+            // Cars, boats and subs use steering buttons in place of the whole
+            // stick; bikes retain its vertical lean axis alongside those buttons.
         } else if leftZone {
             // In swipe modes the entire left side is reserved for movement;
             // even a second left finger must not become a camera gesture.
             if point.y > safe.minY + safe.height * 0.2, !has(isStick) {
+                // In bike steering-button mode, the stick's vertical axis is
+                // still lean while a second finger steers with the buttons.
                 roles[id] = context.driving ? .steer : .moveStick
                 moveStick.begin(at: point)
             }
@@ -1439,7 +1452,7 @@ final class TouchControlsView: UIView {
             state.leftX = Float(copysign(pow(abs(steer), 1.3), steer))
             let tilt = moveStick.value.y
             if context == .bike || context == .bicycle {
-                state.leftY = Float(tilt)
+                state.leftY = Float(moveStick.verticalValue)
             } else {
                 // Cars, boats and subs: up/down pitches in the air or underwater. A wide dead zone keeps
                 // sloppy steering from tilting.

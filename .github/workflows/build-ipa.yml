@@ -1,6 +1,4 @@
-# Diagnostic-branch variant of the registered workflow. Select this branch explicitly.
-# No automatic trigger and no Release publication; original branches are unchanged.
-name: Build IPA (Temporal input diagnostics only)
+name: Build IPA (build 24 — streaming and audio)
 
 on:
   workflow_dispatch:
@@ -21,7 +19,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: temporal-input-diagnostics-${{ github.repository }}
+  group: build-ipa-${{ github.repository }}
   cancel-in-progress: false
 
 jobs:
@@ -127,24 +125,23 @@ jobs:
             ./build_ipa.sh "$SERVER" ${{ github.event_name != 'public' && !inputs.paid_account && '--free' || '' }}
           fi
 
-      - name: Label this as diagnostics only and include the exact source
+      - name: Give this update a distinct filename and include the installation guide
         run: |
-          mv GTA5Port.ipa GTA5Port_TemporalInputDiagnostics.ipa
-          printf 'Source commit: %s\nDiagnostics only; no Temporal reconstruction is enabled.\n' "$BUILD_SOURCE_SHA" > Temporal-Diagnostics-Source.txt
+          mv GTA5Port.ipa GTA5Port_1.4.6_b24.ipa
+          cp docs/INSTALL_BUILD_24_ZH.txt Install_Guide_ZH.txt
 
-      - name: Validate the diagnostic device IPA
-        run: /usr/bin/python3 app/Scripts/validate_private_ipa.py GTA5Port_TemporalInputDiagnostics.ipa --report IPA-Validation.json
+      - name: Validate the device IPA
+        run: /usr/bin/python3 app/Scripts/validate_private_ipa.py GTA5Port_1.4.6_b24.ipa --report IPA-Validation.json
 
       - uses: actions/upload-artifact@v4
         with:
-          name: GTA5Port-temporal-input-diagnostics-${{ github.run_id }}
+          name: GTA5Port-b24-streaming-audio
           path: |
-            GTA5Port_TemporalInputDiagnostics.ipa
+            GTA5Port_1.4.6_b24.ipa
             IPA-Validation.json
             A17-Codegen-Validation.json
             Build23-Feature-Validation.json
-            Temporal-Diagnostics-Source.txt
-            docs/TEMPORAL_DIAGNOSTICS_2026-10-31.md
+            Install_Guide_ZH.txt
           retention-days: 3
 
       - name: Keep the build log if any check fails

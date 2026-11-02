@@ -20,9 +20,10 @@ with zipfile.ZipFile(args.ipa) as archive:
     if len(infos) != 1:
         raise SystemExit('Expected exactly one app inside Payload.')
     info = plistlib.loads(archive.read(infos[0]))
-    assert info['CFBundleVersion'] == '23', 'Wrong app build number'
+    assert info['CFBundleVersion'] == '24', 'Wrong app build number'
     assert info['CFBundleShortVersionString'] == '1.4.6', 'Unexpected base app version'
-    assert info.get('PGCustomBuildLabel') == 'MetalFX Super Resolution + Stability'
+    assert info.get('PGCustomBuildLabel') == 'MetalFX Spatial + Streaming + Audio'
+    assert 'PGDiagnosticBuildSHA' not in info, 'Retired temporal diagnostic build metadata remains'
     assert info.get('PGEngineRequiresLSE') is True
     assert info.get('PGEngineCodegen') == 'apple-a11 / tune apple-a17 / LSE'
     app = infos[0].rsplit('/', 1)[0] + '/'
@@ -61,6 +62,8 @@ with zipfile.ZipFile(args.ipa) as archive:
     assert metalfx and all(x['weak'] for x in metalfx), 'MetalFX must remain weak-linked for older iOS versions'
     for removed in [b'AI frame generation (MetalFX)', b'PGMetalRendererSetFrameGeneration', b'pgfg_motion']:
         assert removed not in executable, 'Removed frame-generation implementation remains'
+    for removed in [b'PGTDProbe', b'PGTDRecordMetal', b'NativeTemporalCameraProbe', b'TemporalDiagnosticsViewController']:
+        assert removed not in executable, 'Retired temporal diagnostic implementation remains'
     assert info.get('UIFileSharingEnabled') is True
     assert info.get('LSSupportsOpeningDocumentsInPlace') is True
     assert info.get('MinimumOSVersion', '16.0').split('.')[0] == '16', 'Accidental minimum OS bump'
@@ -72,6 +75,7 @@ report = {'ipa': args.ipa.name, 'bytes': args.ipa.stat().st_size, 'sha256': dige
           'bundle_identifier': info['CFBundleIdentifier'], 'version': info['CFBundleShortVersionString'],
           'build': info['CFBundleVersion'], 'minimum_os': info.get('MinimumOSVersion'),
           'arm64_executable': True, 'metal_fx_weak_linked': True, 'frame_generation_removed': True,
+          'temporal_diagnostics_removed': True,
           'file_sharing_enabled': True,
           'archive_crc': 'PASS', 'device_launch_tested': False}
 args.report.write_text(json.dumps(report, indent=2) + '\n')
